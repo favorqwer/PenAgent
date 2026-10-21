@@ -51,7 +51,7 @@ Windows 对 Kali 的控制分为 **PenAgent 自动化调度控制** 和 **人工
 
 ### 1. PenAgent 框架自动控制
 
-项目配置文件 [`basic_config.yaml`](file:///C:/Users/Favor/Desktop/PenAgent/basic_config.yaml) 中已写入 Kali 节点配置：
+项目配置文件 [`config/yaml/basic_config.yaml`](file:///C:/Users/Favor/Desktop/PenAgent/config/yaml/basic_config.yaml) 中已写入 Kali 节点配置：
 
 ```yaml
 kali:

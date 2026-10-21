@@ -2,16 +2,18 @@
 
 The system allows customization of basic settings, database configurations, knowledge base settings, and LLM configurations.
 
+All YAML configuration files are organized in the [`config/yaml/`](config/yaml/) directory:
+
 ## Configuration Files
 
-- `basic_config.yaml` – General system settings.
-- `db_config.yaml` – Database connection settings.
-- `kb_config.yaml` – Knowledge base settings.
-- `model_config.yaml` – LLM (Large Language Model) settings.
+- [`config/yaml/basic_config.yaml`](config/yaml/basic_config.yaml) – General system & Kali SSH settings.
+- [`config/yaml/db_config.yaml`](config/yaml/db_config.yaml) – Local SQLite database settings.
+- [`config/yaml/model_config.yaml`](config/yaml/model_config.yaml) – LLM (Large Language Model) API settings.
+- [`config/yaml/kb_config.yaml`](config/yaml/kb_config.yaml) – Knowledge base & RAG settings.
 
 ## Configuration Structure
 
-### 1. Basic Configuration (`basic_config.yaml`)
+### 1. Basic Configuration (`config/yaml/basic_config.yaml`)
 
 This section defines core settings for the system.
 
@@ -32,18 +34,14 @@ This section defines core settings for the system.
   - `api_server`: API server host and port.
   - `webui_server`: Web UI host and port.
 
-### 2. Database Configuration (`db_config.yaml`)
+### 2. Database Configuration (`config/yaml/db_config.yaml`)
 
-This section defines MySQL database connection settings.
+This section defines local SQLite storage settings (serverless, no MySQL daemon required).
 
-- MySQL
-  - `host`: Database host.
-  - `port`: Database port.
-  - `user`: Username for authentication.
-  - `password`: Password for authentication.
-  - `database`: Database name.
+- SQLite
+  - `sqlite_path`: Path to local SQLite database file (default: `data/penagent.db`).
 
-### 3. Knowledge Base Configuration (`kb_config.yaml`)
+### 3. Knowledge Base Configuration (`config/yaml/kb_config.yaml`)
 
 Defines settings related to the knowledge base system.
 
@@ -59,23 +57,17 @@ Defines settings related to the knowledge base system.
   - `text_splitter_dict`: Defines text splitters used for processing.
   - `text_splitter_name`: Selected text splitter method.
 
-### 4. LLM Configuration (`model_config.yaml`)
+### 4. LLM Configuration (`config/yaml/model_config.yaml`)
 
 Defines settings for the language model.
 
 - API Settings
   - `api_key`: API key for accessing the model.
-  - `base_url`: Base URL for API requests.
-  - `llm_model`: LLM provider (default: OpenAI).
+  - `base_url`: Base URL for OpenAI-compatible API requests.
+  - `llm_model`: LLM provider (`openai` or `ollama`).
   - `llm_model_name`: Specific LLM model name.
-- Embedding Settings
-  - `embedding_models`: Embedding model used.
-  - `embedding_type`: Embedding type (`local`, `remote`).
-  - `context_length`: Maximum context length.
-  - `embedding_url`: URL for embedding API.
 - Processing Parameters
   - `temperature`: Model temperature.
   - `history_len`: Length of conversation history.
   - `timeout`: Timeout value for requests.
   - `proxies`: Proxy settings for API requests.
-

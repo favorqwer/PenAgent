@@ -10,6 +10,8 @@ from config.pydantic_settings_file import *
 from config.pydantic_settings_file import BaseFileSettings
 
 PENTEST_ROOT = Path(os.environ.get("PENTEST_ROOT", ".")).resolve()
+CONFIG_YAML_DIR = (PENTEST_ROOT / "config" / "yaml").resolve()
+CONFIG_YAML_DIR.mkdir(parents=True, exist_ok=True)
 
 
 class Mode(StrEnum):
@@ -22,7 +24,7 @@ class Mode(StrEnum):
 
 
 class BasicConfig(BaseFileSettings):
-    model_config = SettingsConfigDict(yaml_file=PENTEST_ROOT / "basic_config.yaml")
+    model_config = SettingsConfigDict(yaml_file=CONFIG_YAML_DIR / "basic_config.yaml")
 
     log_verbose: bool = True
 
@@ -62,12 +64,12 @@ class BasicConfig(BaseFileSettings):
 
 
 class DBConfig(BaseFileSettings):
-    model_config = SettingsConfigDict(yaml_file=PENTEST_ROOT / "db_config.yaml")
+    model_config = SettingsConfigDict(yaml_file=CONFIG_YAML_DIR / "db_config.yaml")
     sqlite_path: str = str(PENTEST_ROOT / "data" / "penagent.db")
 
 
 class KBConfig(BaseFileSettings):
-    model_config = SettingsConfigDict(yaml_file=PENTEST_ROOT / "kb_config.yaml")
+    model_config = SettingsConfigDict(yaml_file=CONFIG_YAML_DIR / "kb_config.yaml")
 
     default_vs_type: str = "milvus"
 
@@ -114,7 +116,7 @@ class KBConfig(BaseFileSettings):
 
 
 class LLMConfig(BaseFileSettings):
-    model_config = SettingsConfigDict(yaml_file=PENTEST_ROOT / "model_config.yaml")
+    model_config = SettingsConfigDict(yaml_file=CONFIG_YAML_DIR / "model_config.yaml")
 
     api_key: str = ""
     llm_model: str = "openai"
@@ -133,6 +135,7 @@ class LLMConfig(BaseFileSettings):
 
 class ConfigsContainer:
     PENTEST_ROOT = PENTEST_ROOT
+    CONFIG_YAML_DIR = CONFIG_YAML_DIR
 
     basic_config: BasicConfig = settings_property(BasicConfig())
     kb_config: KBConfig = settings_property(KBConfig())
