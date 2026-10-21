@@ -3,196 +3,204 @@ import time
 from typing import Optional
 import paramiko
 
-
-class SSHOutputHandler:
-    """Handles SSH output processing with improved encoding detection and buffering."""
-
-    ENCODINGS = ['utf-8', 'latin-1', 'cp1252', 'ascii']
-    BUFFER_SIZE = 8192
-
-    @staticmethod
-    def decode_output(data: bytes) -> str:
-        """Attempts to decode byte data using multiple encodings."""
-        for encoding in SSHOutputHandler.ENCODINGS:
-            try:
-                return data.decode(encoding)
-            except UnicodeDecodeError:
-                continue
-        return data.decode('utf-8', errors='replace')
-
-    @staticmethod
-    def receive_data(shell: paramiko.Channel, timeout: float) -> str:
-        """Receives data from shell with improved timeout handling."""
-        start_time = time.time()
-        retries = 0
-        out = ""
-
-        while True:
-            if shell.recv_ready():
-                data = shell.recv(SSHOutputHandler.BUFFER_SIZE)
-                decoded_data = SSHOutputHandler.decode_output(data)
-                out += decoded_data
-
-            # Split the output into lines and clean up empty lines
-            lines = out.split('\n')
-            lines = [x.strip() for x in lines if x.strip() != '']
-
-            if len(lines) > 0:
-                last_line = lines[-1].strip()
-
-                # Handle sudo mode detection
-                if 'sudo' in last_line:
-                    retries += 1
-
-                # Check for common shell prompt formats
-                if ('@' in last_line and (last_line[-1] == '$' or last_line[-1] == '#')) or \
-                        ('bash' in last_line and (last_line[-1] == '$' or last_line[-1] == '#')):
-                    break
-                elif last_line[-1] in ['?', '$', '#'] or \
-                        '--more--' in last_line.lower():
-                    retries += 1
-                elif last_line[-1] == ':' and '::' not in last_line and '-->' not in last_line:
-                    retries += 1
-                elif last_line[-1] == '>' and '<' not in last_line and '-->' not in last_line:
-                    retries += 1
-                elif any(pattern in last_line.lower() for pattern in ['[y/n]', '[Y/n/q]', 'yes/no/[fingerprint]', '(yes/no)']):
-                    retries += 1
-                elif 'What do you want to do about modified configuration file sshd_config?' in out:
-                    break  # Special case handling for configuration prompts
-
-                # Stop if retries exceed threshold
-                if retries >= 3:
-                    break
-
-            # Check for timeout
-            if time.time() - start_time > timeout:
-                shell.send('\x03')
-                break
-
-            # Continuously receive more data from the shell
-            time.sleep(0.1)  # Small delay to avoid tight loop
-
-        return out  # Return whatever has been received so far
+from config.config import Configs
 
 
 class RemoteShell:
-    """Enhanced remote shell handler with improved prompt detection and command execution."""
+    """Production-grade RemoteShell with a Hybrid Execution Engine:
+    1. Direct non-interactive execution (exec_command) for standard tools (nmap, gobuster, etc.):
+       - Isolated stdout and stderr
+       - True exit code capture ($?)
+       - Zero terminal echo and ANSI escape sequences
+       - Non-blocking sudo password injection
+    2. Sentinel delimiter protocol for persistent interactive PTY sessions (msfconsole, etc.):
+       - Exact command completion detection using a unique delimiter
+       - No fragile prompt guessing
+    3. Output sanitization and safe truncation to protect LLM context windows.
+    """
 
     FORBIDDEN_COMMANDS = {'apt', 'apt-get'}
+    MAX_OUTPUT_LENGTH = 16000  # Truncate threshold to protect LLM context
 
-    def __init__(self, shell: paramiko.Channel, timeout: float = 120.0, command_timeout: float = 120.0):
-        self.shell = shell
+    def __init__(self, ssh_client: paramiko.SSHClient, timeout: float = 120.0, command_timeout: float = 120.0):
+        self.ssh_client = ssh_client
+        self.timeout = timeout
         self.command_timeout = command_timeout
-        self._setup_shell(timeout)
+        self._interactive_channel: Optional[paramiko.Channel] = None
+        self._sudo_password = Configs.basic_config.kali.get("password", "")
 
-    def _setup_shell(self, timeout: float) -> None:
-        """Initializes shell settings."""
-        try:
-            self.shell.settimeout(timeout)
-            self.shell.set_combine_stderr(True)
+    @property
+    def shell(self) -> paramiko.Channel:
+        """Compatibility property for code accessing shell.shell directly."""
+        return self._get_interactive_channel()
 
-            # Create .hushlogin to suppress the welcome message
-            self.execute_cmd("touch ~/.hushlogin")
+    def _get_interactive_channel(self) -> paramiko.Channel:
+        """Lazily creates and initializes an interactive PTY channel if needed."""
+        if self._interactive_channel is None or self._interactive_channel.closed:
+            self._interactive_channel = self.ssh_client.invoke_shell()
+            self._interactive_channel.settimeout(self.command_timeout)
+            time.sleep(0.5)
+            # Drain initial motd / banner
+            if self._interactive_channel.recv_ready():
+                self._interactive_channel.recv(8192)
+        return self._interactive_channel
 
-            # Update MOTD settings to disable welcome banners
-            motd_commands = [
-                "sudo touch /etc/legal",  # Empty legal notice
-                "sudo chmod 644 /etc/legal",
-                "sudo rm -f /etc/motd",  # Remove message of the day
-                "sudo rm -f /etc/update-motd.d/*"  # Remove dynamic MOTD scripts
-            ]
+    @staticmethod
+    def strip_ansi(text: str) -> str:
+        """Removes terminal escape codes, ANSI colors, and bracketed paste sequences."""
+        pattern = r'\x1b(\[[0-9;?]*[a-zA-Z]|\([a-zA-Z]|[=>])|\x00|\r'
+        return re.sub(pattern, '', text)
 
-            for cmd in motd_commands:
-                self.execute_cmd(cmd)
-
-        except Exception as e:
-            print(f"Shell setup warning: {e}")
+    def _truncate_output(self, text: str) -> str:
+        """Truncates excessively large outputs to keep LLM context safe and cost-effective."""
+        if len(text) <= self.MAX_OUTPUT_LENGTH:
+            return text
+        half = self.MAX_OUTPUT_LENGTH // 2
+        head = text[:half]
+        tail = text[-half:]
+        return f"{head}\n\n... [Output truncated: total {len(text)} bytes] ...\n\n{tail}"
 
     def _check_forbidden_commands(self, cmd: str) -> Optional[str]:
-        """Validates command against forbidden commands list."""
         cmd_parts = cmd.split()
-        if any(cmd in self.FORBIDDEN_COMMANDS for cmd in cmd_parts):
+        if any(c in self.FORBIDDEN_COMMANDS for c in cmd_parts):
             return "Command not allowed: network tunneling tools are restricted"
         return None
 
     def execute_cmd(self, cmd: str) -> str:
-        """Executes command with improved output handling and error recovery."""
-        if error_msg := self._check_forbidden_commands(cmd):
-            return error_msg
+        """Main entry point. Intelligently routes between clean exec_command and interactive PTY."""
+        cmd = cmd.strip()
+        if not cmd:
+            return ""
 
-        self.shell.send(cmd + '\n')
+        if err := self._check_forbidden_commands(cmd):
+            return err
 
-        output = self._handle_normal_execution()
+        # Determine if command strictly requires persistent PTY (e.g., msfconsole)
+        interactive_tools = ('msfconsole', 'ftp', 'smbclient')
+        is_interactive = any(tool in cmd for tool in interactive_tools)
 
-        final_output = ''.join(output)
+        if is_interactive:
+            raw_result = self._execute_pty(cmd)
+        else:
+            raw_result = self._execute_exec(cmd)
 
+        # Tool-specific post-processing if needed
         if "dirb" in cmd and "gobuster" not in cmd:
-            return clean_dirb_output(final_output)
-
+            return clean_dirb_output(raw_result)
         elif "msfconsole" in cmd:
-            return clean_msfconsole_output(final_output)
+            return clean_msfconsole_output(raw_result)
 
-        return final_output
+        return raw_result
 
-    def _handle_normal_execution(self) -> list:
-        """Handles normal command execution flow."""
-        output = []
+    def _execute_exec(self, cmd: str) -> str:
+        """Executes one-shot command using SSH exec_command (fast, clean, isolated streams, exact exit code)."""
+        actual_cmd = cmd
+        # Automatically inject sudo password non-interactively if sudo is used
+        if actual_cmd.startswith("sudo ") or " sudo " in actual_cmd:
+            if self._sudo_password:
+                # Use sudo -S -p '' to consume password silently from stdin pipe
+                if actual_cmd.startswith("sudo "):
+                    actual_cmd = f"echo '{self._sudo_password}' | sudo -S -p '' {actual_cmd[5:]}"
+                else:
+                    actual_cmd = actual_cmd.replace(" sudo ", f" echo '{self._sudo_password}' | sudo -S -p '' ")
 
-        time.sleep(.5)
-        data = SSHOutputHandler.receive_data(self.shell, timeout=self.command_timeout)
-        if data != '':
-            output.append(data)
-        last_line = data.strip().split('\n')[-1]
+        try:
+            stdin, stdout, stderr = self.ssh_client.exec_command(
+                actual_cmd,
+                timeout=self.command_timeout,
+                get_pty=False
+            )
+            raw_out = stdout.read().decode('utf-8', errors='replace')
+            raw_err = stderr.read().decode('utf-8', errors='replace')
+            exit_code = stdout.channel.recv_exit_status()
 
-        if any(pattern in last_line.lower() for pattern in
-               ['[y/n]', '[Y/n/q]', 'yes/no/[fingerprint]', '(yes/no)']):
-            self.shell.send("yes\n")
-            time.sleep(.5)
-            data = SSHOutputHandler.receive_data(self.shell, timeout=self.command_timeout)
-            if data != '':
-                output.append(data)
+            clean_out = self.strip_ansi(raw_out).strip()
+            clean_err = self.strip_ansi(raw_err).strip()
 
-        return output
+            result_parts = []
+            if clean_out:
+                result_parts.append(clean_out)
+            if clean_err:
+                # If command succeeded with minor warnings on stderr, or failed with stderr
+                if exit_code != 0:
+                    result_parts.append(f"[STDERR]: {clean_err}")
+                elif not clean_out:
+                    result_parts.append(clean_err)
+
+            if exit_code != 0:
+                result_parts.append(f"[Exit Status: {exit_code}]")
+
+            final_result = "\n".join(result_parts) if result_parts else "Command executed successfully with no output."
+            return self._truncate_output(final_result)
+
+        except Exception as e:
+            return f"Command execution failed: {str(e)}"
+
+    def _execute_pty(self, cmd: str) -> str:
+        """Executes interactive command using PTY with Sentinel Delimiter protocol."""
+        channel = self._get_interactive_channel()
+        sentinel = f"__PENAGENT_STATUS_{int(time.time() * 1000)}__"
+        wrapped_cmd = f"{cmd}\necho \"{sentinel}:$?:__END__\"\n"
+
+        channel.send(wrapped_cmd)
+
+        start_time = time.time()
+        buf = ""
+        pattern = re.compile(rf"{sentinel}:(-?\d+):__END__")
+
+        while True:
+            if channel.recv_ready():
+                chunk = channel.recv(8192).decode('utf-8', errors='replace')
+                buf += chunk
+
+                match = pattern.search(buf)
+                if match:
+                    exit_code = match.group(1)
+                    raw_output = buf[: match.start()]
+                    lines = raw_output.splitlines()
+                    # Remove the echoed command line if present
+                    if lines and cmd in lines[0]:
+                        lines = lines[1:]
+                    clean_output = self.strip_ansi("\n".join(lines)).strip()
+                    if exit_code != "0":
+                        clean_output += f"\n[Exit Status: {exit_code}]"
+                    return self._truncate_output(clean_output)
+
+            if time.time() - start_time > self.command_timeout:
+                channel.send('\x03')  # Send Ctrl+C on timeout
+                time.sleep(0.5)
+                clean_output = self.strip_ansi(buf).strip()
+                return f"{clean_output}\n[Command timed out after {self.command_timeout}s]"
+
+            time.sleep(0.05)
+
+    def close(self):
+        """Closes interactive channel."""
+        if self._interactive_channel:
+            try:
+                self._interactive_channel.close()
+            except:
+                pass
+            self._interactive_channel = None
 
 
-def clean_dirb_output(output):
+def clean_dirb_output(output: str) -> str:
     """Clean the output from the 'dirb' command."""
-    # Remove ANSI escape sequences (for colored output)
     output = re.sub(r'\x1b\[[0-9;]*[mGKH]', '', output)
-
-    # Extract initial summary lines (URL_BASE, WORDLIST_FILES, etc.)
     summary_pattern = r"(URL_BASE:.*\n|WORDLIST_FILES:.*\n|GENERATED WORDS:.*\n|---- Scanning URL:.*\n)"
     summary = "\n".join(re.findall(summary_pattern, output))
-
-    # Extract the discovered URLs (lines with CODE and SIZE)
     url_pattern = r"http[^\s]+ \(CODE:[0-9]+\|SIZE:[0-9]+\)"
     urls = "\n".join(re.findall(url_pattern, output))
-
-    # Extract the final downloaded and found information
     stats_pattern = r"DOWNLOADED: \d+ - FOUND: \d+"
     stats = "\n".join(re.findall(stats_pattern, output))
-
-    # Combine summary, URLs, and stats
-    cleaned_output = f"{summary}\n{urls}\n{stats}"
-
-    return cleaned_output
+    return f"{summary}\n{urls}\n{stats}".strip()
 
 
-def clean_msfconsole_output(output):
+def clean_msfconsole_output(output: str) -> str:
     """Clean the output from the 'msfconsole' command."""
-
     output = re.sub(r'\x1b\[[0-9;]*[mGKH]', '', output)
-
-    cleaned = [line for line in output.splitlines() if
-               not any(x in line.lower() for x in
-                       ["loading", "warning:", "starting", "====="])]
-
-    # Keep relevant parts such as version info, exploits, payloads, and prompt
-    relevant_output = []
-    for line in cleaned:
-        if line.strip() and any(
-                keyword in line.lower() for keyword in ['metasploit', 'exploits', 'payloads', ' >', '-', '+']):
-            relevant_output.append(line.strip())
-
-    # Join the relevant output
-    return "\n".join(cleaned)
+    cleaned = [
+        line for line in output.splitlines()
+        if not any(x in line.lower() for x in ["loading", "warning:", "starting", "====="])
+    ]
+    return "\n".join(cleaned).strip()

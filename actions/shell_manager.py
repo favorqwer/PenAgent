@@ -18,28 +18,36 @@ class ShellManager:
             cls._instance = cls()
         return cls._instance
 
+    def is_alive(self) -> bool:
+        """Checks if underlying SSH transport is active."""
+        if self._ssh_client is None:
+            return False
+        transport = self._ssh_client.get_transport()
+        return transport is not None and transport.is_active()
+
     def get_shell(self) -> RemoteShell:
-        if self._shell is None:
+        """Returns the RemoteShell instance, auto-reconnecting if disconnected."""
+        if self._shell is None or not self.is_alive():
             self._connect()
         return self._shell
 
     def _connect(self):
-        if self._ssh_client is None:
-            self._ssh_client = paramiko.SSHClient()
-            self._ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            self._ssh_client.connect(
-                hostname=Configs.basic_config.kali['hostname'],
-                username=Configs.basic_config.kali['username'],
-                password=Configs.basic_config.kali['password'],
-                port=Configs.basic_config.kali['port']
-            )
-        if self._shell is None:
-            self._shell = RemoteShell(self._ssh_client.invoke_shell(), command_timeout=self.command_timeout)
+        self.close()
+        self._ssh_client = paramiko.SSHClient()
+        self._ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        self._ssh_client.connect(
+            hostname=Configs.basic_config.kali['hostname'],
+            username=Configs.basic_config.kali['username'],
+            password=Configs.basic_config.kali['password'],
+            port=Configs.basic_config.kali['port'],
+            timeout=10,
+        )
+        self._shell = RemoteShell(self._ssh_client, command_timeout=self.command_timeout)
 
     def close(self):
         if self._shell:
             try:
-                self._shell.shell.close()
+                self._shell.close()
             except:
                 pass
             self._shell = None
