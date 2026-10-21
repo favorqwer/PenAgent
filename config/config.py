@@ -63,13 +63,7 @@ class BasicConfig(BaseFileSettings):
 
 class DBConfig(BaseFileSettings):
     model_config = SettingsConfigDict(yaml_file=PENTEST_ROOT / "db_config.yaml")
-    mysql: dict = {
-        "host": "",
-        "port": 3306,
-        "user": "",
-        "password": "",
-        "database": ""
-    }
+    sqlite_path: str = str(PENTEST_ROOT / "data" / "penagent.db")
 
 
 class KBConfig(BaseFileSettings):

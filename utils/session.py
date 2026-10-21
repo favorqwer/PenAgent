@@ -1,5 +1,6 @@
 from contextlib import contextmanager
 from functools import wraps
+from pathlib import Path
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
@@ -7,14 +8,23 @@ from sqlalchemy.ext.declarative import DeclarativeMeta, declarative_base
 
 from config.config import Configs
 
+# Pure local SQLite engine
+sqlite_path = getattr(Configs.db_config, "sqlite_path", None)
+if not sqlite_path:
+    sqlite_path = str(Configs.PENTEST_ROOT / "data" / "penagent.db")
 
-db_url = f"mysql+pymysql://{Configs.db_config.mysql['user']}:{Configs.db_config.mysql['password']}@{Configs.db_config.mysql['host']}:{Configs.db_config.mysql['port']}/{Configs.db_config.mysql['database']}"
+p = Path(sqlite_path)
+if not p.is_absolute():
+    p = Configs.PENTEST_ROOT / p
+p.parent.mkdir(parents=True, exist_ok=True)
 
-engine = create_engine(db_url)
+db_url = f"sqlite:///{p.as_posix()}"
+engine = create_engine(db_url, connect_args={"check_same_thread": False})
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 Base: DeclarativeMeta = declarative_base()
+
 
 @contextmanager
 def session_scope() -> Session:
@@ -46,4 +56,9 @@ def with_session(f):
 
 
 def create_tables():
+    import db.models.session_model
+    import db.models.plan_model
+    import db.models.task_model
+    import db.models.conversation_model
+    import db.models.message_model
     Base.metadata.create_all(bind=engine)
