@@ -1,6 +1,7 @@
 import asyncio
 import re
 import time
+import uuid
 
 import httpx
 from typing import List, Optional
@@ -24,7 +25,15 @@ logger = build_logger()
 class OpenAIChat(ABC):
     def __init__(self, config):
         self.config = config
-        self.client = OpenAI(api_key=self.config.api_key, base_url=self.config.base_url, timeout=config.timeout)
+        default_headers = {}
+        if "opencode" in str(self.config.base_url).lower():
+            default_headers["x-opencode-session"] = str(uuid.uuid4())
+        self.client = OpenAI(
+            api_key=self.config.api_key,
+            base_url=self.config.base_url,
+            timeout=config.timeout,
+            default_headers=default_headers or None
+        )
         self.model_name = self.config.llm_model_name
 
     @retry(
