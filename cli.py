@@ -38,6 +38,23 @@ main.add_command(startup_main, "start")
 main.add_command(pentest_main, "penagent")
 main.add_command(pentest_main, "vulnbot")
 
+
+@main.command("graph", help="Run autonomous penetration testing via LangGraph state graph")
+@click.option("-t", "--target", "target", default="100.84.151.2", help="Target host IP or domain (default: 100.84.151.2)")
+@click.option("-d", "--desc", "desc", default="Autonomous penetration testing and privilege escalation", help="Task objective description")
+@click.option("-s", "--session-id", "session_id", default=None, help="Resume an existing session thread ID")
+@click.option("--hitl", "hitl", is_flag=True, default=False, help="Enable Human-in-the-Loop approval before exploitation")
+@click.option("--timeout", "timeout", default=120, help="Per-command execution timeout in seconds")
+def graph_cmd(target, desc, session_id, hitl, timeout):
+    from actions.shell_manager import ShellManager
+    from pipeline.runner import run_pentest_pipeline
+    ShellManager.command_timeout = timeout
+    try:
+        run_pentest_pipeline(target=target, task_desc=desc, thread_id=session_id, hitl_enabled=hitl)
+    finally:
+        ShellManager.get_instance().close()
+
+
 # Benchmark & Evaluation Subgroup
 @main.group(name="benchmark", help="Benchmark evaluation against baseline models (PentestGPT / Single-Agent Baseline)")
 def benchmark():
