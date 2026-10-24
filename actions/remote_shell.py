@@ -66,11 +66,15 @@ class RemoteShell:
             return "Command not allowed: network tunneling tools are restricted"
         return None
 
-    def execute_cmd(self, cmd: str) -> str:
-        """Main entry point. Intelligently routes between clean exec_command and interactive PTY."""
+    def execute_cmd(self, cmd: str, timeout: Optional[float] = None) -> str:
+        """Main entry point. Intelligently routes between clean exec_command and interactive PTY.
+
+        ``timeout`` overrides the instance default for this single command only.
+        """
         cmd = cmd.strip()
         if not cmd:
             return ""
+        effective_timeout = timeout if timeout and timeout > 0 else self.command_timeout
 
         if err := self._check_forbidden_commands(cmd):
             return err
@@ -80,9 +84,9 @@ class RemoteShell:
         is_interactive = any(tool in cmd for tool in interactive_tools)
 
         if is_interactive:
-            raw_result = self._execute_pty(cmd)
+            raw_result = self._execute_pty(cmd, timeout=effective_timeout)
         else:
-            raw_result = self._execute_exec(cmd)
+            raw_result = self._execute_exec(cmd, timeout=effective_timeout)
 
         # Tool-specific post-processing if needed
         if "dirb" in cmd and "gobuster" not in cmd:
@@ -92,8 +96,9 @@ class RemoteShell:
 
         return raw_result
 
-    def _execute_exec(self, cmd: str) -> str:
+    def _execute_exec(self, cmd: str, timeout: Optional[float] = None) -> str:
         """Executes one-shot command using SSH exec_command (fast, clean, isolated streams, exact exit code)."""
+        timeout = timeout or self.command_timeout
         actual_cmd = cmd
         # Automatically inject sudo password non-interactively if sudo is used
         if actual_cmd.startswith("sudo ") or " sudo " in actual_cmd:
@@ -107,7 +112,7 @@ class RemoteShell:
         try:
             stdin, stdout, stderr = self.ssh_client.exec_command(
                 actual_cmd,
-                timeout=self.command_timeout,
+                timeout=timeout,
                 get_pty=False
             )
             raw_out = stdout.read().decode('utf-8', errors='replace')
@@ -136,8 +141,9 @@ class RemoteShell:
         except Exception as e:
             return f"Command execution failed: {str(e)}"
 
-    def _execute_pty(self, cmd: str) -> str:
+    def _execute_pty(self, cmd: str, timeout: Optional[float] = None) -> str:
         """Executes interactive command using PTY with Sentinel Delimiter protocol."""
+        timeout = timeout or self.command_timeout
         channel = self._get_interactive_channel()
         sentinel = f"__PENAGENT_STATUS_{int(time.time() * 1000)}__"
         wrapped_cmd = f"{cmd}\necho \"{sentinel}:$?:__END__\"\n"
@@ -166,11 +172,11 @@ class RemoteShell:
                         clean_output += f"\n[Exit Status: {exit_code}]"
                     return self._truncate_output(clean_output)
 
-            if time.time() - start_time > self.command_timeout:
+            if time.time() - start_time > timeout:
                 channel.send('\x03')  # Send Ctrl+C on timeout
                 time.sleep(0.5)
                 clean_output = self.strip_ansi(buf).strip()
-                return f"{clean_output}\n[Command timed out after {self.command_timeout}s]"
+                return f"{clean_output}\n[Command timed out after {timeout}s]"
 
             time.sleep(0.05)
 
