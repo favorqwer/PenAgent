@@ -55,6 +55,13 @@ class BasicConfig(BaseFileSettings):
 
     webui_server: dict = {"host": default_bind_host, "port": 8501}
 
+    langsmith: dict = {
+        "enabled": False,
+        "api_key": "",
+        "project": "PenAgent",
+        "endpoint": "https://api.smith.langchain.com",
+    }
+
     def make_dirs(self):
         for p in [
             self.LOG_PATH,
