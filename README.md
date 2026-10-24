@@ -94,6 +94,26 @@ python cli.py penagent -m {max_interactions}
 
 Replace `{max_interactions}` with the desired number of interactions. (For compatibility, `python cli.py vulnbot` is also supported).
 
+### Layered Agent
+
+An alternative orchestration engine with LLM-written task plans, a ReAct loop per
+task, evidence-based verification, layered budgets, command-level approval and
+checkpointed resume:
+
+```sh
+python cli.py agent -t 100.84.151.2                 # full run
+python cli.py agent -t 100.84.151.2 --dry-run       # no API calls, no SSH
+python cli.py agent -t 100.84.151.2 --hitl          # approve intrusive commands
+python cli.py agent -t 100.84.151.2 --thread-id my-run --resume
+
+# switch lab (Kali + target), see agents.md for the IP table
+run_lab1.cmd
+run_lab2.cmd
+```
+
+See [docs/AGENT.md](docs/AGENT.md) for the architecture, state model,
+verdict rules and extension points. The original `penagent` command and benchmark are unchanged.
+
 ### Benchmark & Evaluation
 
 PenAgent includes built-in benchmarking harnesses to evaluate and compare performance against baseline approaches:

@@ -39,18 +39,65 @@ main.add_command(pentest_main, "penagent")
 main.add_command(pentest_main, "vulnbot")
 
 
-@main.command("graph", help="Run autonomous penetration testing via LangGraph state graph")
-@click.option("-t", "--target", "target", default="100.84.151.2", help="Target host IP or domain (default: 100.84.151.2)")
-@click.option("-d", "--desc", "desc", default="Autonomous penetration testing and privilege escalation", help="Task objective description")
-@click.option("-s", "--session-id", "session_id", default=None, help="Resume an existing session thread ID")
-@click.option("--hitl", "hitl", is_flag=True, default=False, help="Enable Human-in-the-Loop approval before exploitation")
-@click.option("--timeout", "timeout", default=120, help="Per-command execution timeout in seconds")
-def graph_cmd(target, desc, session_id, hitl, timeout):
+@main.command("agent", help="Run the layered agent (plan -> ReAct -> verify) with checkpointing")
+@click.option("-t", "--target", "target", required=True, help="Target host IP or domain")
+@click.option(
+    "-d",
+    "--desc",
+    "desc",
+    default="Autonomous penetration test: obtain and prove the highest practical level of access.",
+    help="Engagement goal",
+)
+# Lab profiles (keep in sync with agents.md):
+#   lab1: kali 100.74.213.15 -> target 100.84.151.2
+#   lab2: kali 100.116.135.31 -> target 100.86.108.4
+@click.option(
+    "--kali",
+    "kali",
+    default=None,
+    help="Kali host override. lab1=100.74.213.15, lab2=100.116.135.31",
+)
+@click.option("--thread-id", "thread_id", default=None, help="Stable thread id for resume / time travel")
+@click.option("--resume", "resume", is_flag=True, default=False, help="Resume an existing thread")
+@click.option("--hitl", "hitl", is_flag=True, default=False, help="Require approval for intrusive commands")
+@click.option(
+    "--hitl-scope",
+    "hitl_scope",
+    type=click.Choice(["command", "task"]),
+    default="command",
+    help="Approval granularity",
+)
+@click.option("--dry-run", "dry_run", is_flag=True, default=False, help="Scripted model + shell, no API/SSH calls")
+@click.option("--max-commands", "max_commands", type=int, default=None, help="Global command budget")
+@click.option("--deadline", "deadline", type=float, default=None, help="Wall-clock budget in minutes")
+@click.option("--command-timeout", "command_timeout", type=int, default=120, help="Global per-command timeout cap (seconds)")
+@click.option("--quiet", "quiet", is_flag=True, default=False, help="Only print the final report")
+def agent_cmd(
+    target, desc, thread_id, resume, hitl, hitl_scope, dry_run,
+    max_commands, deadline, command_timeout, kali, quiet
+):
     from actions.shell_manager import ShellManager
-    from pipeline.runner import run_pentest_pipeline
-    ShellManager.command_timeout = timeout
+    from agent.runner import run_agent
+
+    if resume and not thread_id:
+        raise click.UsageError("--resume requires --thread-id")
+
+    ShellManager.command_timeout = int(command_timeout)
+
     try:
-        run_pentest_pipeline(target=target, task_desc=desc, thread_id=session_id, hitl_enabled=hitl)
+        run_agent(
+            target=target,
+            goal=desc,
+            thread_id=thread_id,
+            hitl=hitl,
+            hitl_scope=hitl_scope,
+            dry_run=dry_run,
+            resume=resume,
+            max_commands=max_commands,
+            deadline_minutes=deadline,
+            kali=kali,
+            quiet=quiet,
+        )
     finally:
         ShellManager.get_instance().close()
 

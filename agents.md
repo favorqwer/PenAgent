@@ -45,6 +45,22 @@
 
 ---
 
+### 连接配置切换（lab1 / lab2）
+
+两套实验环境通过 `--kali` + `-t` 切换，端口与账号密码沿用 `config/yaml/basic_config.yaml`：
+
+| 配置 | Kali | 靶机 | 命令 |
+| :--- | :--- | :--- | :--- |
+| **lab1** | `100.74.213.15` | `100.84.151.2` | `run_lab1.cmd` 或 `python cli.py agent --kali 100.74.213.15 -t 100.84.151.2` |
+| **lab2** | `100.116.135.31` | `100.86.108.4` | `run_lab2.cmd` 或 `python cli.py agent --kali 100.116.135.31 -t 100.86.108.4` |
+
+说明：
+
+- `--kali` 只覆盖 Kali 主机地址，SSH 端口、用户名、密码仍来自 `basic_config.yaml`。
+- 切换时会关闭已打开的 SSH 连接，下一条命令自动连到新 Kali。
+- 默认 thread id 形如 `agent-<target>-<随机串>`；用 `--resume` 恢复时若 checkpoint 里的目标与 `-t` 不一致会直接报错，避免串环境。
+- 旧命令 `penagent` 也支持 `--kali`。
+
 ## 二、Windows 如何控制 Kali（攻击机）
 
 Windows 对 Kali 的控制分为 **PenAgent 自动化调度控制** 和 **人工终端直接控制** 两种途径：
