@@ -18,20 +18,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from langgraph.types import Command
 
 from agent import memory, settings
-from agent.contracts import PlanSpec, TaskSpec
-from agent.fake import FakeShell, RULES, install_dry_run, uninstall
-from agent.findings import (
-    evidence_verdict,
-    extract_findings,
-    has_compromise_evidence,
-    observations_digest,
-    render_facts,
-)
-from agent.graphs import create_agent_graph
+from agent.schema import PlanSpec, TaskSpec
+from agent.dry_run import FakeShell, RULES, install_dry_run, uninstall
+from agent.context import observations_digest
+from agent.findings import extract_findings, has_compromise_evidence, render_facts
+from agent.graph import create_agent_graph
 from agent.plan import merge_plan, order_plan, select_next_task
 from agent.policy import classify_command
-from agent.task_nodes import extract_text_command
-from agent.state import merge_events, merge_ports, merge_services, merge_vulns
+from agent.schema import merge_events, merge_ports, merge_services, merge_vulns
 
 
 def _initial(thread_id: str, hitl: bool = False) -> dict:
@@ -140,10 +134,6 @@ class TestPolicyAndEvidence(unittest.TestCase):
         self.assertTrue(has_compromise_evidence("uid=0(root) gid=0(root)"))
         self.assertFalse(has_compromise_evidence("root:x:0:0:root:/root:/bin/bash"))
 
-        self.assertFalse(evidence_verdict("exploiter", "Exploit", "root:x:0:0", "curl x")["passed"])
-        self.assertTrue(evidence_verdict("exploiter", "Exploit", "uid=0(root)", "curl x")["passed"])
-        self.assertTrue(evidence_verdict("collector", "Shell", nmap, "nmap -sV")["passed"])
-
     def test_model_claims_are_not_evidence(self):
         from langchain_core.messages import AIMessage, ToolMessage
 
@@ -189,17 +179,31 @@ class TestKaliOverride(unittest.TestCase):
             self.assertEqual(Configs.basic_config.kali.get("port"), 22)
             self.assertEqual(Configs.basic_config.kali.get("username"), "kali")
         finally:
+            from actions.shell_manager import ShellManager
+
+            ShellManager.set_host_override(None)
             Configs.basic_config.kali["hostname"] = original
 
+    def test_override_survives_a_config_cache_miss(self):
+        """--kali must not be reverted when another config object is touched.
 
-class TestTextFallback(unittest.TestCase):
-    def test_extracts_commands_from_prose(self):
-        fenced = "I will scan it now." + chr(10) + chr(10) + "```" + chr(10) + "nmap -sV -T4 10.0.0.5" + chr(10) + "```"
-        self.assertEqual(extract_text_command(fenced), "nmap -sV -T4 10.0.0.5")
-        self.assertEqual(extract_text_command("$ curl -sS http://x/health"), "curl -sS http://x/health")
-        self.assertEqual(extract_text_command("1. gobuster dir -u http://x -w list"), "gobuster dir -u http://x -w list")
-        self.assertEqual(extract_text_command("Let me think about the target first."), "")
-        self.assertEqual(extract_text_command("this is not a command; rm -rf /"), "")
+        The settings objects are re-read from YAML on every shared-cache miss, and
+        the cache holds one entry, so reading llm_config evicts basic_config and
+        silently restores the hostname from the file. That is how a lab2 run
+        ended up connecting to the lab1 Kali box.
+        """
+        from config.config import Configs
+        from agent.runner import apply_kali
+        from actions.shell_manager import ShellManager
+
+        original = Configs.basic_config.kali.get("hostname")
+        try:
+            apply_kali("10.9.9.9")
+            _ = Configs.llm_config.llm_model_name
+            self.assertEqual(ShellManager.effective_host(), "10.9.9.9")
+        finally:
+            ShellManager.set_host_override(None)
+            Configs.basic_config.kali["hostname"] = original
 
 
 class TestRealSSH(unittest.TestCase):
@@ -252,6 +256,15 @@ class TestFullGraph(GraphHarness):
         self.assertEqual(state.get("phase"), "done")
         self.assertEqual(len(state.get("phase_summaries") or []), 3)
         self.assertGreaterEqual(state.get("commands_used", 0), 6)
+        # Counting must not double at subgraph boundaries: the task subgraph
+        # returns an absolute total, the parent channel overwrites (no reducer).
+        from agent import tools as shell_module
+
+        self.assertEqual(
+            state.get("commands_used"),
+            len(shell_module.get_shell().calls),
+            "commands_used must match the number of executed commands exactly",
+        )
         self.assertIn(22, state.get("open_ports") or [])
         self.assertIn("/admin:200", [v.get("identifier") for v in state.get("vulnerabilities") or []])
         self.assertTrue(state.get("tried_vectors"), "failed Apache attempt should be recorded")
@@ -282,7 +295,7 @@ class TestFullGraph(GraphHarness):
     def test_backtrack_when_exploitation_keeps_failing(self):
         brain = install_dry_run("100.84.151.2")
         # Remove the Tomcat rules so both exploit tasks fail.
-        from agent import shell as shell_module
+        from agent import tools as shell_module
 
         shell_module.set_shell_override(
             FakeShell([(needle, out) for needle, out in RULES if "manager/text/deploy" not in needle and "exec?cmd=id" not in needle])
