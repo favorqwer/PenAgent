@@ -2,129 +2,22 @@
 
 from __future__ import annotations
 
+import threading
 import uuid
-from typing import Any, Dict, Optional
+from datetime import datetime
+from typing import Any, Dict, List, Optional
 
 from langgraph.types import Command
 from rich.console import Console
-from rich.markdown import Markdown
-from rich.markup import escape
-from rich.panel import Panel
-from rich.prompt import Prompt
-from rich.table import Table
 
 from config.config import Configs
 
-from agent import shell
-from agent.findings import clip
-from agent.graphs import create_agent_graph
-from agent.policy import describe_risk
+from agent import telemetry, ui
+from agent.graph import create_agent_graph
+from agent.llm import reset_llm_clients, warm_up
 from agent.settings import cfg
-from agent.tracing import build_run_config, flush_tracing, init_langsmith_tracing
-
-
-RISK_STYLE = {
-    "read": "green",
-    "probe": "cyan",
-    "intrusive": "yellow",
-    "destructive": "bold red",
-    "unknown": "magenta",
-}
-
-
-class AgentUI:
-    def __init__(self, console: Optional[Console] = None, quiet: bool = False):
-        self.console = console or Console()
-        self.quiet = quiet
-        self._last_plan = ""
-
-    def event(self, payload: Dict[str, Any]) -> None:
-        if self.quiet:
-            return
-        kind = payload.get("kind")
-        if kind == "scope":
-            prior = " (prior knowledge loaded)" if payload.get("prior") else ""
-            self.console.print(
-                Panel(
-                    f"[bold]Target[/bold]: {payload.get('target')}\n"
-                    f"[bold]Goal[/bold]: {payload.get('goal')}{prior}",
-                    title="Engagement scope",
-                    border_style="bright_blue",
-                )
-            )
-        elif kind == "plan":
-            self._render_plan(payload)
-        elif kind == "replan":
-            self.console.print(
-                Panel(
-                    self._plan_table(payload.get("tasks") or []),
-                    title=f"Replanning {payload.get('phase')} (v{payload.get('version')})",
-                    border_style="yellow",
-                )
-            )
-        elif kind == "task":
-            task = payload.get("task") or {}
-            self.console.rule(f"[bold]{payload.get('phase')}[/bold] · {task.get('id')} {task.get('instruction', '')[:90]}")
-        elif kind == "step":
-            tools = ", ".join(payload.get("tools") or []) or "no tool call"
-            self.console.print(f"  [dim]step {payload.get('step')} -> {tools}[/dim]")
-        elif kind == "command":
-            status = payload.get("status")
-            colour = "green" if status == "success" else "red"
-            self.console.print(f"  [{colour}]$ {escape(str(payload.get('command')))}[/{colour}]")
-            output = (payload.get("output") or "").strip()
-            if output:
-                self.console.print(f"  [dim]{escape(clip(output, 600))}[/dim]")
-        elif kind == "verdict":
-            ok = payload.get("success")
-            style = "bold green" if ok else "bold red"
-            objective = (payload.get("objective") or {}).get("detail", "")
-            self.console.print(
-                f"  [{style}]{'PASS' if ok else 'FAIL'}[/{style}] {escape(str(payload.get('reason', '')))}"
-                f" [dim]({escape(str(objective))})[/dim]"
-            )
-        elif kind == "handover":
-            self.console.print(
-                Panel(
-                    escape(clip(payload.get("summary", ""), 2000)),
-                    title=f"Handover: {payload.get('phase')} ({payload.get('outcome')})",
-                    border_style="green",
-                )
-            )
-        elif kind == "report":
-            self.console.print(
-                Panel(
-                    f"compromised: {payload.get('compromised')}\nreport: {payload.get('path')}",
-                    title="Report",
-                    border_style="bright_green",
-                )
-            )
-
-    def _plan_table(self, tasks) -> Table:
-        table = Table(show_lines=False, expand=True)
-        table.add_column("#", width=3)
-        table.add_column("id", width=10)
-        table.add_column("status", width=9)
-        table.add_column("instruction", overflow="fold")
-        table.add_column("depends", width=14)
-        for index, task in enumerate(tasks, 1):
-            table.add_row(
-                str(index),
-                escape(str(task.get("id", ""))),
-                escape(str(task.get("status", ""))),
-                escape(str(task.get("instruction", ""))),
-                escape(",".join(task.get("depends_on") or []) or "-"),
-            )
-        return table
-
-    def _render_plan(self, payload: Dict[str, Any]) -> None:
-        self.console.print(
-            Panel(
-                self._plan_table(payload.get("tasks") or []),
-                title=f"Plan: {payload.get('phase')} (v{payload.get('version')})",
-                border_style="blue",
-            )
-        )
+from agent.tools import close_shell, default_timeout
+from agent.telemetry import build_run_config, flush_tracing, init_langsmith_tracing
 
 
 def _split_chunk(chunk):
@@ -147,41 +40,67 @@ def _interrupt_payload(chunk: Any) -> Optional[Dict[str, Any]]:
     return value if isinstance(value, dict) else {"type": "unknown", "raw": str(value)}
 
 
-def ask_decision(console: Console, payload: Dict[str, Any]) -> Dict[str, Any]:
-    console.print(
-        Panel(
-            f"Phase: [bold]{payload.get('phase')}[/bold]\nTask: {payload.get('task', '')}",
-            title="[bold red]Command approval required[/bold red]",
-            border_style="red",
+def _local_time(stamp: Any) -> str:
+    """Render a checkpoint timestamp in the operator's timezone.
+
+    LangGraph stores ``created_at`` as timezone-aware UTC; slicing the string
+    silently presented UTC as local time (8 hours off in this lab).
+    """
+    text = str(stamp or "")
+    try:
+        return datetime.fromisoformat(text).astimezone().strftime("%Y-%m-%d %H:%M")
+    except ValueError:
+        return text[:19].replace("T", " ")
+
+
+def history_rows(thread_id: str, limit: int = 40) -> List[Dict[str, Any]]:
+    """Checkpoint timeline for one thread, newest first."""
+    app = create_agent_graph()
+    config = {"configurable": {"thread_id": thread_id}}
+    rows: List[Dict[str, Any]] = []
+    for snapshot in app.get_state_history(config):
+        values = snapshot.values or {}
+        configurable = (snapshot.config or {}).get("configurable") or {}
+        rows.append(
+            {
+                "created_at": _local_time(snapshot.created_at),
+                "checkpoint_id": str(configurable.get("checkpoint_id", "")),
+                "checkpoint_short": str(configurable.get("checkpoint_id", ""))[-6:],
+                "step": (snapshot.metadata or {}).get("step"),
+                "next": ",".join(snapshot.next or ()) or "end",
+                "phase": values.get("phase", ""),
+                "commands": int(values.get("commands_used") or 0),
+                "compromised": bool(values.get("is_compromised")),
+                "pending_approval": bool(getattr(snapshot, "interrupts", ())),
+            }
         )
-    )
-    for item in payload.get("commands") or []:
-        style = RISK_STYLE.get(item.get("risk", ""), "white")
-        console.print(f"  [{style}]$ {escape(str(item.get('command')))}[/{style}]")
-        console.print(
-            f"    [dim]intent: {escape(str(item.get('intent', '')))} | risk: {escape(str(item.get('risk')))} "
-            f"({describe_risk(item.get('risk', ''))}) | {escape(str(item.get('risk_reason', '')))}[/dim]"
-        )
+        if len(rows) >= limit:
+            break
+    return rows
 
-    choice = Prompt.ask(
-        "Approve? [bold]y[/bold]=yes  [bold]n[/bold]=no  [bold]e[/bold]=edit  [bold]a[/bold]=approve rest of task",
-        default="n",
-        choices=["y", "n", "e", "a"],
-    ).lower()
 
-    if choice == "y":
-        return {"approved": True}
-    if choice == "a":
-        return {"approved": True, "scope": "task"}
-    if choice == "e":
-        commands = []
-        for item in payload.get("commands") or []:
-            edited = Prompt.ask("command", default=item.get("command", ""))
-            commands.append(edited)
-        return {"approved": True, "commands": commands}
+def show_history(
+    thread_id: str, console: Optional[Console] = None, limit: int = 40
+) -> List[Dict[str, Any]]:
+    """Print the checkpoint timeline of a thread (newest first)."""
+    console = console or Console()
+    return ui.render_history(history_rows(thread_id, limit), thread_id, console)
 
-    reason = Prompt.ask("Reason for denial", default="operator denied")
-    return {"approved": False, "reason": reason}
+
+def find_checkpoint(app, config: Dict[str, Any], needle: str):
+    """Resolve a checkpoint id (full, prefix or suffix) to a snapshot.
+
+    Checkpoint ids inside one thread share their leading characters, so the
+    history view prints and matches the trailing part instead.
+    """
+    needle = (needle or "").strip()
+    if not needle:
+        return None
+    for snapshot in app.get_state_history(config):
+        checkpoint_id = str(((snapshot.config or {}).get("configurable") or {}).get("checkpoint_id", ""))
+        if checkpoint_id == needle or checkpoint_id.endswith(needle) or checkpoint_id.startswith(needle):
+            return snapshot
+    return None
 
 
 def _build_initial_state(
@@ -228,15 +147,22 @@ def apply_kali(host: Optional[str]) -> str:
 
     Accounts/port keep coming from basic_config.yaml; only the host changes.
     Any already-open SSH channel is closed so the next command reconnects.
+
+    The host is stored on ShellManager as well as in Configs: the settings
+    objects are re-read from YAML on every cache miss, so mutating Configs alone
+    reverts as soon as anything touches another config object (e.g. llm_config).
     """
+    from actions.shell_manager import ShellManager
+
     host = (host or "").strip()
     if host:
         Configs.basic_config.kali["hostname"] = host
+        ShellManager.set_host_override(host)
         try:
-            shell.close()
+            close_shell()
         except Exception:
             pass
-    return str(Configs.basic_config.kali.get("hostname", "") or "")
+    return ShellManager.effective_host()
 
 
 def run_agent(
@@ -247,6 +173,7 @@ def run_agent(
     hitl_scope: str = "command",
     dry_run: bool = False,
     resume: bool = False,
+    from_checkpoint: Optional[str] = None,
     max_commands: Optional[int] = None,
     deadline_minutes: Optional[float] = None,
     kali: Optional[str] = None,
@@ -254,7 +181,7 @@ def run_agent(
     quiet: bool = False,
 ) -> Dict[str, Any]:
     console = console or Console()
-    ui = AgentUI(console, quiet=quiet)
+    progress_ui = ui.AgentUI(console, quiet=quiet)
     kali_host = apply_kali(kali)
 
     if deadline_minutes is not None:
@@ -264,10 +191,17 @@ def run_agent(
 
     brain = None
     if dry_run:
-        from agent.fake import install_dry_run
+        from agent.dry_run import install_dry_run
 
         brain = install_dry_run(target)
         console.print("[yellow]DRY RUN: scripted model + scripted shell, no API calls, no SSH.[/yellow]")
+
+    telemetry.reset()
+    reset_llm_clients()
+    if not dry_run:
+        # Hide the ~9.7s cold start: the handshake happens while the graph and
+        # the memory lookup get ready.
+        threading.Thread(target=warm_up, name="llm-warmup", daemon=True).start()
 
     thread_id = thread_id or f"agent-{target}-{uuid.uuid4().hex[:8]}"
     console.print(f"[dim]lab: kali={kali_host} target={target} thread={thread_id}[/dim]")
@@ -277,14 +211,38 @@ def run_agent(
         console.print(
             f"[dim]planning model: {cfg('models.planner') or 'default'} | "
             f"LangSmith: {'ON' if tracing_on else 'OFF'} | "
-            f"command timeout: {shell.default_timeout()}s[/dim]"
+            f"command timeout: {default_timeout()}s[/dim]"
         )
 
     app = create_agent_graph()
     config = build_run_config(thread_id, target, hitl, dry_run)
-
     pending: Any
-    if resume:
+    run_config: Dict[str, Any] = config
+    if from_checkpoint:
+        snapshot = find_checkpoint(app, config, from_checkpoint)
+        if snapshot is None:
+            raise SystemExit(
+                f"No checkpoint matching '{from_checkpoint}' in thread '{thread_id}'. "
+                "Run with --history to list the available ids."
+            )
+        stored_target = (snapshot.values or {}).get("target")
+        if stored_target and stored_target != target:
+            raise SystemExit(
+                f"Checkpoint '{from_checkpoint}' belongs to target {stored_target}, not {target}."
+            )
+        pending = None
+        run_config = dict(config)
+        run_config["configurable"] = dict(snapshot.config.get("configurable") or {})
+        next_nodes = ", ".join(snapshot.next or ()) or "nothing (end of run)"
+        console.print(
+            f"[bold]Forking[/bold] thread {thread_id} from checkpoint {from_checkpoint} "
+            f"(phase={snapshot.values.get('phase', '?')}, commands={snapshot.values.get('commands_used', 0)}, "
+            f"next={next_nodes})"
+        )
+        if not snapshot.next:
+            console.print("[yellow]That checkpoint has nothing left to run; pick an earlier one.[/yellow]")
+            return dict(snapshot.values or {})
+    elif resume:
         snapshot = app.get_state(config)
         if not snapshot.values:
             raise SystemExit(f"No checkpoint found for thread '{thread_id}'.")
@@ -300,26 +258,27 @@ def run_agent(
                 interrupts += tuple(getattr(task, "interrupts", ()) or ())
         if interrupts:
             payload = getattr(interrupts[0], "value", {}) or {}
-            pending = Command(resume=ask_decision(console, payload))
+            pending = Command(resume=ui.ask_decision(console, payload))
         else:
             pending = None
         console.print(f"[bold]Resuming thread[/bold] {thread_id}")
     else:
         pending = _build_initial_state(target, goal, thread_id, hitl, hitl_scope, dry_run, max_commands, deadline_minutes)
 
+    failed: Optional[str] = None
     try:
         while True:
             interrupted: Optional[Dict[str, Any]] = None
             for chunk in app.stream(
                 pending,
-                config=config,
+                config=run_config,
                 stream_mode=["updates", "custom"],
                 durability="sync",
                 subgraphs=True,
             ):
                 namespace, mode, payload = _split_chunk(chunk)
                 if mode == "custom":
-                    ui.event(payload if isinstance(payload, dict) else {})
+                    progress_ui.event(payload if isinstance(payload, dict) else {})
                     continue
                 interrupt_value = _interrupt_payload(payload if isinstance(payload, dict) else {})
                 if interrupt_value is not None:
@@ -335,23 +294,29 @@ def run_agent(
 
             if interrupted is None:
                 break
-            pending = Command(resume=ask_decision(console, interrupted))
+            pending = Command(resume=ui.ask_decision(console, interrupted))
+    except Exception as exc:  # noqa: BLE001 - report, never hide
+        failed = f"{type(exc).__name__}: {exc}"
+        ui.print_aborted(console, failed, target, thread_id)
     finally:
         if dry_run:
-            from agent.fake import uninstall
+            from agent.dry_run import uninstall
 
             uninstall()
         flush_tracing()
-        shell.close()
+        close_shell()
 
     snapshot = app.get_state(config)
     values = dict(snapshot.values or {})
+    if failed:
+        values["aborted"] = failed
     report = values.get("final_report") or ""
     if report and not quiet:
-        console.print(Panel(Markdown(report), title="Final report", border_style="bright_green"))
+        ui.print_report(console, report)
     console.print(
         f"[bold]thread[/bold]={thread_id}  compromised={values.get('is_compromised')}  "
         f"commands={values.get('commands_used', 0)}"
     )
+    ui.print_usage(console, quiet)
     values["thread_id"] = thread_id
     return values

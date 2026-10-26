@@ -44,6 +44,8 @@ class ActionLog(TypedDict, total=False):
     output: str
     status: str
     duration: float
+    log_path: str
+    exit_code: int
 
 
 def _vuln_key(v: Dict[str, Any]) -> str:
@@ -91,10 +93,12 @@ def merge_vulns(a: List[Dict[str, Any]], b: List[Dict[str, Any]]) -> List[Dict[s
 
 
 def merge_unique(a: List[str], b: List[str]) -> List[str]:
-    out = list(a or [])
+    out = list(dict.fromkeys(a or []))
+    seen = set(out)
     for item in b or []:
-        if item not in out:
+        if item not in seen:
             out.append(item)
+            seen.add(item)
     return out
 
 
@@ -102,7 +106,9 @@ def merge_events(a: List[Dict[str, Any]], b: List[Dict[str, Any]]) -> List[Dict[
     """Deduplicating merge for event logs.
 
     Subgraph boundaries cause the same list to be merged twice (child returns the
-    parent's copy plus its own). Content ids make that idempotent.
+    parent's copy plus its own). Content ids make that idempotent; events without
+    an id fall back to structural equality, otherwise every re-merge would
+    duplicate them.
     """
     out = list(a or [])
     seen = {item.get("id") for item in out if isinstance(item, dict) and item.get("id")}
@@ -112,6 +118,8 @@ def merge_events(a: List[Dict[str, Any]], b: List[Dict[str, Any]]) -> List[Dict[
             if key in seen:
                 continue
             seen.add(key)
+        elif item in out:
+            continue
         out.append(item)
     return out
 
@@ -175,6 +183,9 @@ class PhaseState(FactsState, total=False):
     max_replans: int
     max_tasks: int
 
+    phase_start_commands: int
+    phase_allowance: int
+
     current_task: PenTask
     task_attempt: int
     task_verdict: Dict[str, Any]
@@ -222,6 +233,10 @@ class TaskState(FactsState, total=False):
     approved_commands: List[str]
     last_output: str
 
+    # Convergence guard: identical observations with no new facts.
+    last_fingerprint: str
+    stall_count: int
+
     phase_summaries: Annotated[List[str], merge_unique]
     action_history: Annotated[List[ActionLog], merge_events]
     plan_ids: Annotated[List[str], merge_unique]
@@ -231,3 +246,60 @@ class TaskState(FactsState, total=False):
     commands_used: int
     hitl_enabled: bool
     hitl_scope: str
+
+
+# --- LLM contracts --------------------------------------------------------
+
+from typing import Any, Dict, List, Literal
+
+from pydantic import BaseModel, Field
+
+
+class TaskSpec(BaseModel):
+    id: str = Field(description="Short unique id inside the plan, e.g. t1, t2")
+    dependent_task_ids: List[str] = Field(
+        default_factory=list,
+        description="Ids of tasks that must succeed before this one can run",
+    )
+    instruction: str = Field(
+        description="Concrete action, must mention the target IP or port"
+    )
+    action: Literal["Shell", "Web", "Enumerate", "Exploit"] = Field(
+        default="Shell", description="High level action type"
+    )
+
+
+class PlanSpec(BaseModel):
+    tasks: List[TaskSpec] = Field(description="1-5 ordered tasks for this phase")
+
+
+class ExtractedFacts(BaseModel):
+    """Structured security facts confirmed during a task execution."""
+    open_ports: List[int] = Field(
+        default_factory=list, description="List of confirmed newly open ports, e.g. [80, 443]"
+    )
+    services: Dict[str, str] = Field(
+        default_factory=dict, description="Port to service banner mapping, e.g. {'80': 'nginx 1.18'}"
+    )
+    vulnerabilities: List[Dict[str, Any]] = Field(
+        default_factory=list, description="Discovered vulnerabilities, e.g. [{'cve': 'CVE-2021-44228', 'desc': 'Log4Shell'}]"
+    )
+    credentials: List[str] = Field(
+        default_factory=list, description="Found credentials or tokens, e.g. ['admin:password123']"
+    )
+    flags: List[str] = Field(
+        default_factory=list, description="Captured CTF flags, e.g. ['flag{...}']"
+    )
+
+
+class TaskVerdict(BaseModel):
+    success: bool = Field(description="True only if the task objective was achieved")
+    reason: str = Field(default="", description="Short justification")
+    evidence: str = Field(
+        default="", description="Exact quote from the output that proves the result"
+    )
+    confidence: Literal["low", "medium", "high"] = "medium"
+    facts: ExtractedFacts = Field(
+        default_factory=ExtractedFacts,
+        description="Structured security facts confirmed during this task",
+    )

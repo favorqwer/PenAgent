@@ -31,7 +31,7 @@ COMPLETED TASKS IN THIS PHASE (never repeat these; keep them out of the new plan
 
 FAILED TASKS IN THIS PHASE (do not retry the same approach)
 {failed}
-
+{failure_brief}
 PLANNING RULES
 1. Produce between 1 and {max_tasks} tasks.
 2. Use dependent_task_ids when one task needs another's output. Keep dependencies minimal.
@@ -41,6 +41,8 @@ PLANNING RULES
 6. Prefer commands that finish in under two minutes. Split long scans into stages.
 7. Assign action from: Shell, Web, Enumerate, Exploit.
 8. Instructions must be specific enough that one operator can execute them without guessing.
+9. Never spend a task on a bare reachability check (ping / host discovery): reachability is
+   proven by the port scan that follows, and ICMP is usually filtered on this network.
 {replan_note}
 """
 
@@ -89,6 +91,7 @@ Do not repeat the same command. Change tool, parameters or angle.
 EVALUATOR_SYSTEM = """You are a strict verification agent for a penetration test.
 Decide whether the TASK OBJECTIVE was achieved, using ONLY the transcript.
 Be conservative: intent is not evidence.
+Also extract any confirmed new security facts (open ports, services, vulnerabilities, credentials, flags) from the transcript into the `facts` field.
 """
 
 EVALUATOR_USER = """Task: {instruction}
@@ -99,9 +102,15 @@ TRANSCRIPT
 {digest}
 
 Rules:
-- success=true only if the observations contain concrete evidence that the objective was met.
-- A failed command, an error message, or irrelevant output means failure.
+- success=true only if the observations show that the stated objective was met.
+- Judge the objective as written. If the task asked to run a scan or probe and that scan
+  completed, it succeeded even when the result is negative (no open ports, no
+  directories, an empty UDP reply) - a negative finding is a valid answer.
+- Ignore warnings, retransmission notices and per-port errors as long as the tool
+  produced a usable result; only a command that failed outright (nonzero exit status,
+  timed out) counts as failure.
 - Quote the decisive evidence verbatim in the `evidence` field (empty if none).
+- Extract any confirmed facts into the `facts` field (open ports, service banners, CVEs, credentials, flags). Never guess facts not present in the transcript.
 """
 
 SUMMARIZER_SYSTEM = """You are summarising one phase of an autonomous penetration test.

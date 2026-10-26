@@ -13,9 +13,9 @@ from typing import Any, Dict, List, Sequence, Tuple
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
-from agent.contracts import PlanSpec, TaskSpec, TaskVerdict
+from agent.schema import PlanSpec, TaskSpec, TaskVerdict
 from agent.llm import reset_llm_factory, set_llm_factory
-from agent.shell import reset_shell_override, set_shell_override
+from agent.tools import reset_shell_override, set_shell_override
 
 PORT_SCAN = """Starting Nmap 7.94 ( https://nmap.org )
 Nmap scan report for 100.84.151.2
@@ -115,7 +115,7 @@ SCRIPTS: Dict[Tuple[str, str], List[Dict[str, Any]]] = {
             f"curl -sS 'http://{TARGET}/cgi-bin/.%2e/.%2e/.%2e/.%2e/etc/passwd'",
             "test CVE-2021-41773 path traversal",
         ),
-        _finish(True, "path traversal returned /etc/passwd", PASSWD.splitlines()[0]),
+        _finish(False, "path traversal returned /etc/passwd but no command execution", PASSWD.splitlines()[0]),
     ],
     ("exploiter", "Tomcat"): [
         _exec(
@@ -133,6 +133,7 @@ class DryRunBrain:
         self.target = target
         self.plan_calls = 0
         self.command_calls = 0
+        self.last_finish_success = True
         self._ids = itertools.count(1)
 
     # -- helpers ---------------------------------------------------------
@@ -237,6 +238,7 @@ class DryRunBrain:
                 "execute_kali_command",
                 {"command": action["command"], "intent": action.get("intent", ""), "timeout": 120},
             )
+        self.last_finish_success = bool(action["success"])
         return self._tool_call(
             "finish_task",
             {
@@ -250,7 +252,14 @@ class DryRunBrain:
         if schema is PlanSpec:
             return self._plan(messages)
         if schema is TaskVerdict:
-            return TaskVerdict(success=True, reason="dry-run evaluator accepted the transcript", evidence="dry-run")
+            # The scripted model is the only "judge" in dry-run mode: mirror the
+            # claim it just made so the retry/replan narrative still plays out.
+            success = self.last_finish_success
+            return TaskVerdict(
+                success=success,
+                reason="dry-run evaluator accepted the transcript" if success else "dry-run script reported failure",
+                evidence="dry-run",
+            )
         try:
             return schema()
         except Exception:
@@ -271,7 +280,7 @@ class FakeLLM:
     def bind_tools(self, tools):
         return self
 
-    def invoke(self, messages):
+    def invoke(self, messages, config=None, **kwargs):
         if self.node == "command":
             return self.brain.command(messages)
         return AIMessage(content=self.brain.text(self.node, messages))
@@ -280,7 +289,7 @@ class FakeLLM:
         brain = self.brain
 
         class _Structured:
-            def invoke(self, messages):
+            def invoke(self, messages, config=None, **kwargs):
                 return brain.structured(schema, messages)
 
         return _Structured()

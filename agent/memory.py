@@ -16,18 +16,35 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from agent.settings import cfg, resolve_path
+from utils.log_common import build_logger
+
+logger = build_logger()
 
 _CHECKPOINTER = None
 _STORE = None
-_CONN: Dict[str, sqlite3.Connection] = {}
+_CONN: Dict[Any, sqlite3.Connection] = {}
 
 
-def _conn(path_key: str) -> sqlite3.Connection:
-    if path_key not in _CONN:
+def _conn(path_key: str, *, autocommit: bool = False) -> sqlite3.Connection:
+    """One long-lived connection per (path, isolation mode).
+
+    ``SqliteStore`` issues explicit ``BEGIN``/``COMMIT`` and therefore needs
+    autocommit mode (``isolation_level=None``), exactly like its own
+    ``from_conn_string`` factory. ``SqliteSaver`` relies on implicit
+    transactions, so it keeps the default mode. Sharing one connection between
+    them makes every store write fail with "cannot start a transaction within a
+    transaction".
+    """
+    key = (path_key, autocommit)
+    if key not in _CONN:
         path = resolve_path(path_key)
-        conn = sqlite3.connect(str(path), check_same_thread=False)
-        _CONN[path_key] = conn
-    return _CONN[path_key]
+        conn = sqlite3.connect(
+            str(path),
+            check_same_thread=False,
+            isolation_level=None if autocommit else "",
+        )
+        _CONN[key] = conn
+    return _CONN[key]
 
 
 def get_checkpointer():
@@ -46,7 +63,7 @@ def get_store():
         from langgraph.store.sqlite import SqliteStore
 
         path = cfg("storage.store_path", "data/graph_store.db")
-        _STORE = SqliteStore(_conn(path))
+        _STORE = SqliteStore(_conn(path, autocommit=True))
     return _STORE
 
 
@@ -62,7 +79,8 @@ def load_target_memory(target: str) -> Dict[str, Any]:
         return {}
     try:
         item = get_store().get(NAMESPACE, target)
-    except Exception:
+    except Exception as exc:  # noqa: BLE001 - memory is an optimisation, never a dependency
+        logger.warning(f"[memory] target lookup failed for {target}: {exc}")
         return {}
     return dict(item.value) if item and getattr(item, "value", None) else {}
 
@@ -75,8 +93,9 @@ def save_target_memory(target: str, payload: Dict[str, Any]) -> None:
         merged = _merge_memory(previous, payload)
         merged["updated_at"] = time.time()
         get_store().put(NAMESPACE, target, merged)
-    except Exception:
-        # Memory is an optimisation, never a hard dependency.
+    except Exception as exc:  # noqa: BLE001
+        # Degraded, not fatal: the next session loses prior knowledge.
+        logger.warning(f"[memory] could not persist target memory for {target}: {exc}")
         return
 
 
@@ -121,128 +140,6 @@ def render_target_memory(memory: Dict[str, Any]) -> str:
     if memory.get("is_compromised"):
         lines.append("  previous session reported the target as compromised")
     return "\n".join(lines) or "No prior knowledge about this target."
-
-
-# --------------------------------------------------------------------------- #
-# Projection into the legacy reporting tables
-# --------------------------------------------------------------------------- #
-
-def project_plan(plan_id: str, goal: str, phase: str) -> None:
-    if not cfg("storage.projection", True):
-        return
-    try:
-        from db.models.plan_model import PlanModel
-        from utils.session import session_scope
-
-        with session_scope() as session:
-            row = session.query(PlanModel).filter(PlanModel.id == plan_id).first()
-            if row is None:
-                session.add(
-                    PlanModel(
-                        id=plan_id,
-                        goal=f"[{phase}] {goal}"[:500],
-                        current_task_sequence=0,
-                        plan_chat_id="",
-                        react_chat_id="",
-                    )
-                )
-    except Exception:
-        return
-
-
-def upsert_task(plan_id: str, sequence: int, task: Dict[str, Any]) -> None:
-    if not cfg("storage.projection", True):
-        return
-    try:
-        from db.models.task_model import TaskModel
-        from utils.session import session_scope
-
-        with session_scope() as session:
-            row = (
-                session.query(TaskModel)
-                .filter(TaskModel.plan_id == plan_id, TaskModel.sequence == sequence)
-                .first()
-            )
-            if row is None:
-                row = TaskModel(id=uuid.uuid4().hex, plan_id=plan_id, sequence=sequence)
-                session.add(row)
-            row.action = (task.get("action") or "")[:250]
-            row.instruction = (task.get("instruction") or "")[:500]
-            row.code = list(task.get("commands") or [])
-            row.result = (task.get("result") or "")[:8000]
-            row.is_finished = task.get("status") in ("success", "failed", "blocked")
-            row.is_success = task.get("status") == "success"
-            row.dependencies = list(task.get("depends_on") or [])
-    except Exception:
-        return
-
-
-def sync_plan_tasks(plan_id: str, tasks: List[Dict[str, Any]]) -> None:
-    """Replace the projected rows of one plan (delete + insert, no duplicates)."""
-    if not cfg("storage.projection", True):
-        return
-    try:
-        from db.models.task_model import TaskModel
-        from utils.session import session_scope
-
-        with session_scope() as session:
-            session.query(TaskModel).filter(TaskModel.plan_id == plan_id).delete()
-            for sequence, task in enumerate(tasks or []):
-                session.add(
-                    TaskModel(
-                        id=uuid.uuid4().hex,
-                        plan_id=plan_id,
-                        sequence=sequence,
-                        action=(task.get("action") or "")[:250],
-                        instruction=(task.get("instruction") or "")[:500],
-                        code=list(task.get("commands") or []),
-                        result=(task.get("result") or "")[:8000],
-                        dependencies=list(task.get("depends_on") or []),
-                        is_finished=task.get("status") in ("success", "failed", "blocked"),
-                        is_success=task.get("status") == "success",
-                    )
-                )
-    except Exception:
-        return
-
-
-def project_session(
-    session_id: str,
-    name: str,
-    init_description: str,
-    current_role_name: str,
-    current_planner_id: str,
-    history_planner_ids: List[str],
-) -> None:
-    if not cfg("storage.projection", True):
-        return
-    try:
-        from db.models.session_model import SessionModel
-        from utils.session import session_scope
-
-        with session_scope() as session:
-            row = session.query(SessionModel).filter(SessionModel.id == session_id).first()
-            if row is None:
-                row = SessionModel(id=session_id)
-                session.add(row)
-            row.name = (name or "agent-run")[:50]
-            row.init_description = (init_description or "")[:500]
-            row.current_role_name = current_role_name
-            row.current_planner_id = current_planner_id
-            row.history_planner_ids = ",".join(history_planner_ids or [])
-    except Exception:
-        return
-
-
-def save_report(thread_id: str, text: str) -> Optional[str]:
-    try:
-        directory = resolve_path(cfg("storage.report_dir", "data/reports"))
-        directory.mkdir(parents=True, exist_ok=True)
-        path = Path(directory) / f"{thread_id}.md"
-        path.write_text(text or "", encoding="utf-8")
-        return str(path)
-    except Exception:
-        return None
 
 
 def reset_caches() -> None:

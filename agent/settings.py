@@ -36,6 +36,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "max_task_attempts": 2,
         "max_replans": 2,
         "max_steps_per_task": 8,
+        "llm_retries": 3,
+        "max_stall_rounds": 2,
+        # Split the command budget so late phases cannot be starved by recon.
+        "phase_share": {"collector": 0.3, "scanner": 0.3, "exploiter": 0.4},
         "max_tasks_per_phase": {"collector": 3, "scanner": 4, "exploiter": 5},
     },
     "models": {
@@ -44,6 +48,13 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "evaluator": "",
         "summarizer": "",
         "reporter": "",
+        # This gateway's default model thinks before every answer: 146-341
+        # reasoning tokens for a one-line reply, billed and 2-3x slower.
+        "reasoning_effort": "none",
+        "reasoning_effort_by_node": {},
+        # Honouring HTTP(S)_PROXY costs ~3s of env resolution at startup and does
+        # not speed this gateway up; opt in only if your network needs it.
+        "respect_env_proxy": False,
     },
     "temperatures": {
         "planner": 0.0,
@@ -61,15 +72,16 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "context": {
         "max_tool_output": 6000,
         "max_task_messages": 18,
+        "max_task_context_chars": 24000,
         "max_result_chars": 800,
         "max_evidence_chars": 4000,
-        "max_planner_facts": 12000,
+        "max_planner_facts": 4000,
+        "max_observation_chars": 1800,
     },
     "storage": {
         "checkpoint_path": "data/graph_checkpoints.db",
         "store_path": "data/graph_store.db",
         "report_dir": "data/reports",
-        "projection": True,
     },
 }
 
@@ -92,10 +104,6 @@ def load() -> Dict[str, Any]:
     global _CACHE
     _CACHE = _deep_merge(DEFAULT_CONFIG, _read_yaml(_CONFIG_PATH))
     return _CACHE
-
-
-def reload() -> Dict[str, Any]:
-    return load()
 
 
 def cfg(path: str, default: Any = None) -> Any:

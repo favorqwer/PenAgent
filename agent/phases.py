@@ -6,9 +6,11 @@ The phase subgraph implementation is shared by all phases.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Dict, List, Tuple
+import time
+from dataclasses import dataclass
+from typing import Any, Dict, List, Tuple
 
+from agent.schema import TaskSpec
 from agent.settings import cfg
 
 
@@ -45,7 +47,7 @@ PHASES: Dict[str, PhaseConfig] = {
             "nmap (port scanning, -sV, -O, NSE discovery), whois, dig, whatweb, curl -I, "
             "enum4linux / smbclient for SMB, searchsploit for fingerprints."
         ),
-        allowed_tools=("execute_kali_command", "finish_task", "record_finding"),
+        allowed_tools=("execute_kali_command", "finish_task", "record_finding", "read_artifact"),
         max_tasks=_max_tasks("collector", 3),
         max_steps=int(cfg("budgets.max_steps_per_task", 8)),
         next_phase="scanner",
@@ -63,7 +65,7 @@ PHASES: Dict[str, PhaseConfig] = {
             "nmap NSE scripts, nikto, gobuster/dirb/ffuf, searchsploit, wpscan, whatweb, "
             "sslscan, curl for manual verification."
         ),
-        allowed_tools=("execute_kali_command", "finish_task", "record_finding", "http_probe"),
+        allowed_tools=("execute_kali_command", "finish_task", "record_finding", "http_probe", "read_artifact"),
         max_tasks=_max_tasks("scanner", 4),
         max_steps=int(cfg("budgets.max_steps_per_task", 8)),
         next_phase="exploiter",
@@ -81,7 +83,7 @@ PHASES: Dict[str, PhaseConfig] = {
             "curl PoC requests, searchsploit -m + python, metasploit (msfconsole), sqlmap, "
             "hydra, nc, custom python scripts. Always verify with id / whoami."
         ),
-        allowed_tools=("execute_kali_command", "finish_task", "record_finding", "http_probe"),
+        allowed_tools=("execute_kali_command", "finish_task", "record_finding", "http_probe", "read_artifact"),
         max_tasks=_max_tasks("exploiter", 5),
         max_steps=int(cfg("budgets.max_steps_per_task", 8)),
         next_phase="done",
@@ -110,5 +112,83 @@ def next_phase_key(key: str) -> str:
     return config.next_phase if config else "done"
 
 
+def budget_hit(state: Dict[str, Any]) -> str:
+    """Why the engagement must stop, or "" while there is budget left."""
+    deadline = float(state.get("deadline_ts") or 0)
+    if deadline and time.time() > deadline:
+        return "deadline"
+    used = int(state.get("commands_used", 0))
+    if used >= int(state.get("max_commands", 250)):
+        return "command budget"
+    allowance = int(state.get("phase_allowance") or 0)
+    start = int(state.get("phase_start_commands") or 0)
+    if allowance and used - start >= allowance:
+        return "phase command budget"
+    return ""
+
+
 def phase_index(key: str) -> int:
     return PHASE_ORDER.index(key) if key in PHASE_ORDER else len(PHASE_ORDER)
+
+
+# --- fallback plans -------------------------------------------------------
+# Used only when the planner call fails. One implementation, so the two paths
+# cannot drift apart: derive tasks from the facts we already have, otherwise
+# fall back to the phase template.
+
+_DEFAULT_ROWS: Dict[str, List[Tuple[str, List[str], str, str]]] = {
+    "collector": [
+        ("t1", [], "对 {target} 做全端口扫描，找出所有开放端口", "Shell"),
+        ("t2", ["t1"], "对 {target} 上已开放的端口做服务与版本识别", "Enumerate"),
+    ],
+    "scanner": [
+        ("t1", [], "检索 {target} 上已知服务版本对应的公开漏洞与利用方式", "Enumerate"),
+        ("t2", [], "对 {target} 的 Web 端口做目录与敏感路径枚举", "Web"),
+    ],
+    "exploiter": [
+        ("t1", [], "利用 {target} 上最可能的漏洞并验证命令执行", "Exploit"),
+    ],
+}
+
+
+def _service_label(info: Any) -> str:
+    if isinstance(info, dict):
+        info = info.get("service") or info.get("banner") or ""
+    return str(info).strip()[:80] or "unknown service"
+
+
+def default_tasks(phase: str, state: Dict[str, Any]) -> List[TaskSpec]:
+    """Fallback tasks for one phase, derived from the facts in ``state``."""
+    target = str(state.get("target") or "")
+    ports = [int(p) for p in (state.get("open_ports") or [])]
+    services = state.get("services") or {}
+
+    if ports and phase == "scanner":
+        return [
+            TaskSpec(
+                id=f"t{index}",
+                dependent_task_ids=[],
+                instruction=f"对 {target}:{port} 进行服务识别与漏洞验证（{_service_label(services.get(str(port)))}）",
+                action="Enumerate",
+            )
+            for index, port in enumerate(ports[:3])
+        ]
+    if ports and phase == "exploiter":
+        return [
+            TaskSpec(
+                id="t1",
+                dependent_task_ids=[],
+                instruction=f"利用 {target} 上最可能的漏洞点验证命令执行与权限提升",
+                action="Exploit",
+            )
+        ]
+    rows = _DEFAULT_ROWS.get(phase) or _DEFAULT_ROWS["collector"]
+    return [
+        TaskSpec(
+            id=task_id,
+            dependent_task_ids=list(deps),
+            instruction=text.format(target=target),
+            action=action,
+        )
+        for task_id, deps, text, action in rows
+    ]

@@ -8,13 +8,17 @@ from typing import Any, Dict, List
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.types import Command
 
-from agent import memory
+from agent import memory, telemetry
+from agent import report as report_module
 from agent.findings import clip, render_facts
 from agent.llm import chat
-from agent.phases import PHASE_ORDER, get_phase, phase_index
-from agent.progress import emit
+from agent.phases import budget_hit, PHASE_ORDER, get_phase, phase_index
+from agent.telemetry import emit
 from agent.prompts import REPORTER_SYSTEM, REPORTER_USER
 from agent.settings import cfg
+from utils.log_common import build_logger
+
+logger = build_logger()
 
 
 DEFAULT_CONSTRAINTS = [
@@ -22,15 +26,6 @@ DEFAULT_CONSTRAINTS = [
     "No destructive actions (no deleting data, no DoS, no shutting services down).",
     "Do not install packages on the attack machine.",
 ]
-
-
-def _budget_hit(state: Dict[str, Any]) -> str:
-    deadline = float(state.get("deadline_ts") or 0)
-    if deadline and time.time() > deadline:
-        return "deadline"
-    if int(state.get("commands_used", 0)) >= int(state.get("max_commands", 250)):
-        return "command budget"
-    return ""
 
 
 def scope_node(state: Dict[str, Any]) -> Dict[str, Any]:
@@ -102,7 +97,7 @@ def backtrack_node(state: Dict[str, Any]) -> Command:
 
 
 def route_after_collector(state: Dict[str, Any]) -> str:
-    if _budget_hit(state) or state.get("is_compromised"):
+    if budget_hit(state) or state.get("is_compromised"):
         return "reporter"
     if not state.get("open_ports"):
         return "reporter"
@@ -110,7 +105,7 @@ def route_after_collector(state: Dict[str, Any]) -> str:
 
 
 def route_after_scanner(state: Dict[str, Any]) -> str:
-    if _budget_hit(state) or state.get("is_compromised"):
+    if budget_hit(state) or state.get("is_compromised"):
         return "reporter"
     if state.get("vulnerabilities") or state.get("open_ports"):
         return "exploiter"
@@ -120,67 +115,16 @@ def route_after_scanner(state: Dict[str, Any]) -> str:
 def route_after_exploiter(state: Dict[str, Any]) -> str:
     if state.get("is_compromised"):
         return "reporter"
-    if _budget_hit(state):
+    if budget_hit(state):
         return "reporter"
     if int(state.get("backtrack_count", 0)) < int(state.get("max_backtracks", 1)):
         return "backtrack"
     return "reporter"
 
 
-def _deterministic_report(state: Dict[str, Any]) -> str:
-    facts = render_facts(state, 8000, include_tried=False)
-    summaries = "\n\n".join(state.get("phase_summaries") or []) or "No phase summaries recorded."
-    tried = state.get("tried_vectors") or []
-    compromised = bool(state.get("is_compromised"))
-    lines = [
-        "# PenAgent Assessment Report",
-        "",
-        "## Executive summary",
-        f"Target `{state.get('target', '')}`. Objective: {state.get('goal', '')}",
-        f"Result: {'the objective was achieved (compromise confirmed).' if compromised else 'no verified compromise was achieved.'}",
-        f"Commands executed: {int(state.get('commands_used', 0))}.",
-        "",
-        "## Attack surface",
-        facts,
-        "",
-        "## Phase summaries",
-        summaries,
-        "",
-        "## Failed attempts",
-        *([f"- {item}" for item in tried] or ["- none recorded"]),
-        "",
-        "## Evidence",
-        *(
-            [f"- flag: {flag}" for flag in (state.get("flags") or [])]
-            + [f"- access: {item}" for item in (state.get("credentials") or [])]
-            or ["- no verifiable compromise artifact captured"]
-        ),
-    ]
-    return "\n".join(lines)
-
-
-def _audit(state: Dict[str, Any], report: str) -> str:
-    if not state.get("is_compromised"):
-        return report
-    evidence = " ".join(
-        [
-            " ".join(state.get("flags") or []),
-            " ".join(state.get("credentials") or []),
-            " ".join(str(v.get("evidence", "")) for v in (state.get("vulnerabilities") or []) if isinstance(v, dict)),
-        ]
-    )
-    if "uid=0" in evidence or "root" in evidence.lower() or "flag{" in evidence.lower():
-        return report
-    warning = (
-        "\n\n> **Evidence audit warning**: the run marked the target as compromised, but no "
-        "`uid=0` / root shell / flag artifact was found in the recorded evidence. "
-        "Treat the compromise claim as unverified.\n"
-    )
-    return report + warning
-
-
 def reporter_node(state: Dict[str, Any]) -> Dict[str, Any]:
-    report = _deterministic_report(state)
+    degradation: List[str] = []
+    report = report_module.deterministic(state)
     try:
         enhanced = chat(
             [
@@ -200,24 +144,22 @@ def reporter_node(state: Dict[str, Any]) -> Dict[str, Any]:
             ],
             node="reporter",
         )
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001 - the deterministic report is the fallback
+        logger.warning(f"[reporter] LLM report enhancement failed: {exc}")
         enhanced = ""
+        degradation.append(f"LLM report enhancement failed ({exc}); deterministic report shown.")
     if enhanced and len(enhanced) > 200:
         report = enhanced
 
-    report = _audit(state, report)
-    path = memory.save_report(state.get("thread_id", "run"), report)
+    report += report_module.usage_section()
+    path = report_module.save(state.get("thread_id", "run"), report)
+    if path is None:
+        degradation.append("The report could not be written to disk; it only exists in the final state.")
+    if degradation:
+        report += "\n\n## Run degradations\n" + "\n".join(f"- {item}" for item in degradation)
     emit({"kind": "report", "path": path or "", "compromised": bool(state.get("is_compromised"))})
 
     thread_id = state.get("thread_id") or "run"
-    memory.project_session(
-        session_id=thread_id,
-        name=f"agent-{state.get('target', '')}",
-        init_description=state.get("goal", ""),
-        current_role_name="Exploitation",
-        current_planner_id=(state.get("plan_ids") or [""])[-1],
-        history_planner_ids=list(state.get("plan_ids") or []),
-    )
     memory.save_target_memory(
         state.get("target", ""),
         {

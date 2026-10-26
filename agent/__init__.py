@@ -8,7 +8,7 @@ __all__ = ["create_agent_graph", "run_agent"]
 
 
 def create_agent_graph(*args, **kwargs):  # lazy import keeps `import agent` cheap
-    from agent.graphs import create_agent_graph as _create
+    from agent.graph import create_agent_graph as _create
 
     return _create(*args, **kwargs)
 

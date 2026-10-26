@@ -1,13 +1,16 @@
-"""Deterministic fact extraction and evidence checks.
+"""Deterministic fact extraction.
 
-This module is the "hard evidence" layer: it decides what is objectively true
-from command output, independently of whatever the LLM claims.
+This module only *extracts* and *quotes*: ports, services, CVEs, flags, root
+proof, and compact digests of long output. It never decides whether a task
+succeeded - that judgement belongs to the evaluator model, because penetration
+results are too varied for a closed rule set (a scan that finds nothing is a
+valid answer, a page body can contain "permission denied", and so on).
 """
 
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 PORT_LINE = re.compile(r"^(\d{1,5})/(tcp|udp)\s+open\s*(.*)$", re.MULTILINE)
 GNMAP_PORT = re.compile(r"(\d{1,5})/open/(?:tcp|udp)")
@@ -15,33 +18,11 @@ SERVICE_LINE = re.compile(r"^(\d{1,5})/tcp\s+open\s+(\S+)\s*(.*)$", re.MULTILINE
 CVE = re.compile(r"CVE-\d{4}-\d{4,7}", re.IGNORECASE)
 FLAG = re.compile(r"flag\{[^}]{4,}\}", re.IGNORECASE)
 UID = re.compile(r"uid=(\d+)\(([^)]*)\)")
-UID_ANY = re.compile(r"uid=\d+\(")
 ROOT_PROMPT = re.compile(r"^(?:root@|#\s)", re.MULTILINE)
 SERVER_HEADER = re.compile(r"^Server:\s*(.+)$", re.MULTILINE | re.IGNORECASE)
 HTTP_STATUS = re.compile(r"^HTTP/\d\.\d\s+(\d{3})", re.MULTILINE)
 DIR_HIT = re.compile(r"^\s*(/\S+)\s+\(Status:\s*(\d{3})\)", re.MULTILINE)
 HTML_TITLE = re.compile(r"<title>([^<]{2,120})</title>", re.IGNORECASE)
-
-ERROR_MARKERS = (
-    "command not found",
-    "permission denied",
-    "no such file or directory",
-    "connection refused",
-    "could not resolve",
-    "network is unreachable",
-    "operation timed out",
-    "timed out",
-    "error executing",
-    "[stderr]",
-    "[exit status:",
-    "traceback (most recent call last)",
-    "failed to connect",
-    "authentication failed",
-    "login incorrect",
-)
-
-# Commands whose failure is a legitimate reconnaissance answer, not an error.
-BENIGN_EMPTY = ("nmap", "gobuster", "dirb", "nikto", "whatweb", "curl", "searchsploit")
 
 
 def clip(text: str, limit: int) -> str:
@@ -147,16 +128,6 @@ def extract_findings(
     }
 
 
-def has_execution_evidence(output: str) -> bool:
-    output = output or ""
-    return bool(
-        UID_ANY.search(output)
-        or FLAG.search(output)
-        or re.search(r"meterpreter\s*>", output, re.IGNORECASE)
-        or re.search(r"root@[\w\-]+:.*#", output)
-    )
-
-
 def has_compromise_evidence(output: str) -> bool:
     output = output or ""
     uid = UID.search(output)
@@ -171,76 +142,32 @@ def has_compromise_evidence(output: str) -> bool:
     return False
 
 
-def has_error(output: str) -> bool:
-    lowered = (output or "").lower()
-    return any(marker in lowered for marker in ERROR_MARKERS)
+def render_facts(
+    state: Dict[str, Any],
+    limit: int = 12000,
+    include_tried: bool = True,
+    ports: Optional[Iterable[int]] = None,
+) -> str:
+    """Render the fact table for a prompt.
 
-
-def is_benign_empty(output: str, command: str) -> bool:
-    """A scan that legitimately reports 'nothing found' is not a failure."""
-    if not (output or "").strip():
-        return False
-    lowered = output.lower()
-    if command and command.split()[0] in BENIGN_EMPTY:
-        if "0 hosts up" in lowered or "no open ports" in lowered:
-            return True
-        if "0 / 0" in lowered and "found" in lowered:
-            return True
-    return False
-
-
-def evidence_verdict(
-    phase: str,
-    action: str,
-    output: str,
-    command: str = "",
-    digest: str = "",
-) -> Dict[str, Any]:
-    """Layer-2 of the verdict: objective checks on the raw output and transcript.
-
-    ``digest`` matters because agents often redirect scanner output to files and
-    only print a compact summary; evidence may live in either place.
+    ``ports`` narrows the service list to what a task actually targets; pushing
+    the whole table into every task prompt was the main context cost.
     """
-    output = output or ""
-    haystack = output + chr(10) + (digest or "")
-
-    if has_compromise_evidence(haystack):
-        return {"passed": True, "kind": "compromise", "detail": "root/flag evidence"}
-    if has_execution_evidence(haystack) and phase == "exploiter":
-        return {"passed": True, "kind": "execution", "detail": "command execution evidence"}
-    if has_error(output) and not is_benign_empty(output, command):
-        return {"passed": False, "kind": "error", "detail": "error marker in output"}
-    if phase == "exploiter":
-        return {"passed": False, "kind": "no-compromise", "detail": "no uid=0/flag evidence"}
-    if phase == "collector":
-        if PORT_LINE.search(haystack) or GNMAP_PORT.search(haystack):
-            return {"passed": True, "kind": "ports", "detail": "port table parsed"}
-        if is_benign_empty(output, command):
-            return {"passed": True, "kind": "empty-scan", "detail": "valid empty scan result"}
-    if phase == "scanner":
-        if CVE.search(haystack) or DIR_HIT.search(haystack) or HTML_TITLE.search(haystack):
-            return {"passed": True, "kind": "vuln-signal", "detail": "vulnerability signal"}
-        if is_benign_empty(output, command):
-            return {"passed": True, "kind": "empty-scan", "detail": "valid empty scan result"}
-    return {"passed": False, "kind": "inconclusive", "detail": "no positive evidence"}
-
-
-def summarize_text(text: str, limit: int) -> str:
-    text = (text or "").strip()
-    if len(text) <= limit:
-        return text
-    return clip(text, limit)
-
-
-def render_facts(state: Dict[str, Any], limit: int = 12000, include_tried: bool = True) -> str:
+    wanted = {str(port) for port in (ports or []) if str(port).isdigit()}
     lines: List[str] = []
-    ports = state.get("open_ports") or []
-    if ports:
-        lines.append(f"Open ports: {sorted(ports)}")
+    all_ports = state.get("open_ports") or []
+    if all_ports:
+        lines.append(f"Open ports: {sorted(all_ports)}")
+        if wanted:
+            narrowed = sorted(int(p) for p in all_ports if str(p) in wanted)
+            if narrowed:
+                lines.append(f"Ports this task targets: {narrowed}")
     services = state.get("services") or {}
     if services:
         lines.append("Services:")
         for port in sorted(services, key=lambda p: int(p) if str(p).isdigit() else 0):
+            if wanted and str(port) not in wanted:
+                continue
             info = services[port]
             if isinstance(info, str):
                 info = {"service": info}
@@ -249,7 +176,7 @@ def render_facts(state: Dict[str, Any], limit: int = 12000, include_tried: bool 
     vulns = state.get("vulnerabilities") or []
     if vulns:
         lines.append("Findings:")
-        for vuln in vulns[:12]:
+        for vuln in vulns[:8]:
             label = vuln.get("cve") or vuln.get("name") or vuln.get("identifier") or "finding"
             detail = vuln.get("evidence") or ""
             lines.append(f"  - {label} {('| ' + detail[:160]) if detail else ''}".rstrip())
@@ -268,51 +195,3 @@ def render_facts(state: Dict[str, Any], limit: int = 12000, include_tried: bool 
         lines.append("Status: TARGET COMPROMISED")
     text = "\n".join(lines) or "No findings yet."
     return clip(text, limit)
-
-
-def observations_digest(messages, limit: int = 8000) -> str:
-    """Only factual material: tool outputs and the commands that produced them.
-
-    Deliberately excludes assistant claims (finish_task evidence, reasoning text),
-    otherwise a hallucinated "uid=0" would count as proof.
-    """
-    parts = []
-    for message in messages or []:
-        kind = getattr(message, "type", "")
-        if kind == "tool":
-            content = message.content if isinstance(message.content, str) else str(message.content)
-            parts.append(content)
-        elif kind == "ai":
-            for call in getattr(message, "tool_calls", None) or []:
-                if call.get("name") in ("execute_kali_command", "http_probe"):
-                    args = call.get("args") or {}
-                    parts.append("$ " + str(args.get("command") or args.get("url") or ""))
-    return clip(chr(10).join(parts), limit)
-
-
-def transcript_digest(messages, limit: int = 8000) -> str:
-    """Compact an LLM message list into an evidence transcript."""
-    lines: List[str] = []
-    for message in messages or []:
-        kind = getattr(message, "type", "")
-        if kind == "ai":
-            for call in getattr(message, "tool_calls", None) or []:
-                args = call.get("args") or {}
-                name = call.get("name")
-                if name == "finish_task":
-                    lines.append(f"[finish_task] {args}")
-                elif name == "execute_kali_command":
-                    lines.append(f"$ {args.get('command', '')}")
-                elif name == "record_finding":
-                    lines.append(f"[record_finding] {args}")
-                elif name == "http_probe":
-                    lines.append(f"[http] {args.get('method', 'GET')} {args.get('url', '')}")
-            if isinstance(message.content, str) and message.content.strip():
-                lines.append(f"[assistant] {message.content.strip()[:600]}")
-        elif kind == "tool":
-            content = message.content if isinstance(message.content, str) else str(message.content)
-            lines.append(f"  -> {content.strip()[:1500]}")
-        elif kind == "human":
-            content = message.content if isinstance(message.content, str) else str(message.content)
-            lines.append(f"[instruction] {content.strip()[:800]}")
-    return clip("\n".join(lines), limit)

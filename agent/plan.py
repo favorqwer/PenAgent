@@ -7,16 +7,45 @@ All pure functions - unit testable without an LLM.
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, Iterable, List, Optional
+from collections import Counter
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from agent.contracts import PlanSpec, TaskSpec
-from agent.state import PenTask
+from agent.schema import PlanSpec, TaskSpec
+from agent.schema import PenTask
 
 TERMINAL = {"success", "failed", "blocked"}
+
+IPV4 = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}\b")
+# Chinese puts the number before the noun ("8080 端口") and English after it
+# ("port 8080"), so both orders have to be recognised.
+PORT_PATTERNS = (
+    re.compile(r"(?:端口|port)\s*[:：]?\s*(\d{2,5})(?!\d)", re.IGNORECASE),
+    re.compile(r"(\d{2,5})\s*(?:/tcp|/udp|端口)", re.IGNORECASE),
+    re.compile(r"(\d{2,5})\s+ports?\b", re.IGNORECASE),
+    re.compile(r":(\d{2,5})(?!\d)"),
+)
+PATH_HINT = re.compile(r"(?<![\w.])/[A-Za-z0-9_\-./]{1,60}")
 
 
 def normalize_instruction(text: str) -> str:
     return re.sub(r"\s+", " ", (text or "").strip().lower())
+
+
+def instruction_fingerprint(instruction: str, action: str = "") -> Dict[str, Tuple]:
+    """Structured artefacts an instruction mentions: target, ports, paths."""
+    text = instruction or ""
+    ports = set()
+    for pattern in PORT_PATTERNS:
+        for match in pattern.finditer(text):
+            value = match.group(1)
+            if value and value.isdigit() and 1 <= int(value) <= 65535:
+                ports.add(int(value))
+    return {
+        "action": ((action or "").lower(),),
+        "ips": tuple(sorted(set(IPV4.findall(text)))),
+        "ports": tuple(sorted(ports)),
+        "paths": tuple(sorted(set(PATH_HINT.findall(text)))),
+    }
 
 
 def new_task(spec: TaskSpec, sequence: int, version: int = 1) -> PenTask:
@@ -34,10 +63,10 @@ def new_task(spec: TaskSpec, sequence: int, version: int = 1) -> PenTask:
 
 
 def _match_existing(spec: TaskSpec, old: List[PenTask]) -> Optional[PenTask]:
-    """Match a replanned spec to an old task.
+    """Match a replanned spec to an old task by normalised instruction or id.
 
-    Ids drift between replans, so we match by normalised instruction first and
-    fall back to an id match. Successful tasks are always preserved verbatim.
+    Deliberately exact: fuzzy matching silently merged genuinely different tasks,
+    and the planner already receives the list of completed tasks.
     """
     wanted = normalize_instruction(spec.instruction)
     for task in old:
@@ -195,20 +224,34 @@ def select_next_task(plan: List[PenTask]) -> Optional[PenTask]:
     return None
 
 
-def update_task(
-    plan: List[PenTask],
-    task_id: str,
-    **changes: Any,
-) -> List[PenTask]:
-    updated: List[PenTask] = []
-    for task in plan or []:
-        if task.get("id") == task_id:
-            merged = dict(task)
-            merged.update(changes)
-            updated.append(merged)
-        else:
-            updated.append(dict(task))
-    return updated
+def select_ready_tasks(plan: List[PenTask]) -> List[PenTask]:
+    """All currently runnable tasks whose dependencies are satisfied."""
+    ordered = plan
+    ids = {t["id"] for t in ordered}
+    done = {t["id"] for t in ordered if t.get("status") == "success"}
+    dead = {t["id"] for t in ordered if t.get("status") in ("failed", "blocked")}
+
+    changed = True
+    while changed:
+        changed = False
+        for task in ordered:
+            if task.get("status") in TERMINAL or task.get("status") == "running":
+                continue
+            deps = [d for d in task.get("depends_on", []) if d in ids]
+            if any(d in dead for d in deps):
+                task["status"] = "blocked"
+                task["result"] = "Blocked: a prerequisite task failed"
+                dead.add(task["id"])
+                changed = True
+
+    ready = []
+    for task in ordered:
+        if task.get("status") in TERMINAL or task.get("status") == "running":
+            continue
+        deps = [d for d in task.get("depends_on", []) if d in ids]
+        if all(d in done for d in deps):
+            ready.append(task)
+    return ready
 
 
 def get_task(plan: List[PenTask], task_id: str) -> Optional[PenTask]:
@@ -216,10 +259,6 @@ def get_task(plan: List[PenTask], task_id: str) -> Optional[PenTask]:
         if task.get("id") == task_id:
             return task
     return None
-
-
-def phase_is_exhausted(plan: List[PenTask]) -> bool:
-    return all(t.get("status") in TERMINAL for t in (plan or []))
 
 
 def plan_metrics(plan: List[PenTask]) -> Dict[str, Any]:
