@@ -1,5 +1,7 @@
 import paramiko
 
+from typing import Optional
+
 from actions.remote_shell import RemoteShell
 from config.config import Configs
 
@@ -11,6 +13,19 @@ class ShellManager:
     # Timeout (in seconds) applied to each command execution. Can be overridden
     # before the first connection (e.g. from the CLI) via `ShellManager.command_timeout = ...`.
     command_timeout = 120
+    # CLI `--kali` override. Kept outside Configs on purpose: the settings objects
+    # are reloaded from YAML whenever the shared one-slot settings cache misses
+    # (touching llm_config is enough), which silently reverts in-memory mutations
+    # and sends the run to the host in the YAML file instead.
+    host_override: Optional[str] = None
+
+    @classmethod
+    def set_host_override(cls, host: Optional[str]) -> None:
+        cls.host_override = (host or "").strip() or None
+
+    @classmethod
+    def effective_host(cls) -> str:
+        return cls.host_override or Configs.basic_config.kali["hostname"]
 
     @classmethod
     def get_instance(cls):
@@ -36,7 +51,7 @@ class ShellManager:
         self._ssh_client = paramiko.SSHClient()
         self._ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         self._ssh_client.connect(
-            hostname=Configs.basic_config.kali['hostname'],
+            hostname=self.effective_host(),
             username=Configs.basic_config.kali['username'],
             password=Configs.basic_config.kali['password'],
             port=Configs.basic_config.kali['port'],

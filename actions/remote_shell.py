@@ -4,6 +4,11 @@ from typing import Optional
 import paramiko
 
 from config.config import Configs
+from utils.log_common import build_logger
+
+logger = build_logger()
+
+SUDO_INJECT_PATTERN = re.compile(r"(^|[;&|]\s*)sudo\s+", re.MULTILINE)
 
 
 class RemoteShell:
@@ -27,6 +32,7 @@ class RemoteShell:
         self.timeout = timeout
         self.command_timeout = command_timeout
         self._interactive_channel: Optional[paramiko.Channel] = None
+        self._in_interactive_session: bool = False
         self._sudo_password = Configs.basic_config.kali.get("password", "")
 
     @property
@@ -79,20 +85,24 @@ class RemoteShell:
         if err := self._check_forbidden_commands(cmd):
             return err
 
-        # Determine if command strictly requires persistent PTY (e.g., msfconsole)
-        interactive_tools = ('msfconsole', 'ftp', 'smbclient')
-        is_interactive = any(tool in cmd for tool in interactive_tools)
+        # Determine if command starts or continues an interactive session
+        # One-shot batch executions with script/resource flags should NOT enter persistent PTY
+        is_one_shot_msf = "msfconsole" in cmd and any(flag in cmd for flag in ("-x", "-r", "--resource"))
+        is_one_shot_smb = "smbclient" in cmd and any(flag in cmd for flag in ("-L", "-c", "--command"))
+        is_one_shot_ftp = "ftp" in cmd and any(flag in cmd for flag in ("-n", "-inv", "-i"))
+        is_one_shot = is_one_shot_msf or is_one_shot_smb or is_one_shot_ftp
 
-        if is_interactive:
+        interactive_tools = ('msfconsole', 'ftp', 'smbclient', 'nc -l', 'ncat -l', 'netcat -l')
+        starts_interactive = (not is_one_shot) and any(tool in cmd for tool in interactive_tools)
+        if starts_interactive:
+            self._in_interactive_session = True
+
+        if self._in_interactive_session:
             raw_result = self._execute_pty(cmd, timeout=effective_timeout)
+            if cmd.strip() in ("exit", "quit", "exit -y") or "[Interactive prompt detected" not in raw_result:
+                self._in_interactive_session = False
         else:
             raw_result = self._execute_exec(cmd, timeout=effective_timeout)
-
-        # Tool-specific post-processing if needed
-        if "dirb" in cmd and "gobuster" not in cmd:
-            return clean_dirb_output(raw_result)
-        elif "msfconsole" in cmd:
-            return clean_msfconsole_output(raw_result)
 
         return raw_result
 
@@ -100,27 +110,69 @@ class RemoteShell:
         """Executes one-shot command using SSH exec_command (fast, clean, isolated streams, exact exit code)."""
         timeout = timeout or self.command_timeout
         actual_cmd = cmd
-        # Automatically inject sudo password non-interactively if sudo is used
-        if actual_cmd.startswith("sudo ") or " sudo " in actual_cmd:
-            if self._sudo_password:
-                # Use sudo -S -p '' to consume password silently from stdin pipe
-                if actual_cmd.startswith("sudo "):
-                    actual_cmd = f"echo '{self._sudo_password}' | sudo -S -p '' {actual_cmd[5:]}"
-                else:
-                    actual_cmd = actual_cmd.replace(" sudo ", f" echo '{self._sudo_password}' | sudo -S -p '' ")
+        # Automatically inject sudo password non-interactively if sudo is used at command or pipe start
+        if self._sudo_password and SUDO_INJECT_PATTERN.search(actual_cmd):
+            actual_cmd = SUDO_INJECT_PATTERN.sub(
+                rf"\g<1>echo '{self._sudo_password}' | sudo -S -p '' ", actual_cmd
+            )
 
         try:
+            transport = self.ssh_client.get_transport()
+            if transport is None or not transport.is_active():
+                return "Command execution failed: SSH transport is disconnected."
+
             stdin, stdout, stderr = self.ssh_client.exec_command(
                 actual_cmd,
                 timeout=timeout,
                 get_pty=False
             )
-            raw_out = stdout.read().decode('utf-8', errors='replace')
-            raw_err = stderr.read().decode('utf-8', errors='replace')
-            exit_code = stdout.channel.recv_exit_status()
+            channel = stdout.channel
 
-            clean_out = self.strip_ansi(raw_out).strip()
-            clean_err = self.strip_ansi(raw_err).strip()
+            start_time = time.time()
+            last_heartbeat = start_time
+            out_chunks = []
+            err_chunks = []
+
+            while True:
+                # 1. Transport alive check
+                if transport is None or not transport.is_active():
+                    return f"Command execution failed: SSH connection dropped while running '{cmd}'."
+
+                # 2. Drain stdout and stderr buffers
+                while channel.recv_ready():
+                    out_chunks.append(channel.recv(8192).decode('utf-8', errors='replace'))
+                while channel.recv_stderr_ready():
+                    err_chunks.append(channel.recv_stderr(8192).decode('utf-8', errors='replace'))
+
+                # 3. Check for process completion
+                if channel.exit_status_ready():
+                    while channel.recv_ready():
+                        out_chunks.append(channel.recv(8192).decode('utf-8', errors='replace'))
+                    while channel.recv_stderr_ready():
+                        err_chunks.append(channel.recv_stderr(8192).decode('utf-8', errors='replace'))
+                    break
+
+                now = time.time()
+                # 4. Timeout check
+                if now - start_time > timeout:
+                    try:
+                        channel.close()
+                    except Exception:
+                        pass
+                    partial_out = self.strip_ansi("".join(out_chunks)).strip()
+                    return f"{partial_out}\n[Command timed out after {timeout}s]".strip()
+
+                # 5. Heartbeat every 5.0s
+                if now - last_heartbeat >= 5.0:
+                    elapsed = round(now - start_time, 1)
+                    logger.debug(f"[SSH heartbeat] '{cmd[:50]}' running ({elapsed}s elapsed)...")
+                    last_heartbeat = now
+
+                time.sleep(0.1)
+
+            exit_code = channel.recv_exit_status()
+            clean_out = self.strip_ansi("".join(out_chunks)).strip()
+            clean_err = self.strip_ansi("".join(err_chunks)).strip()
 
             result_parts = []
             if clean_out:
@@ -141,8 +193,15 @@ class RemoteShell:
         except Exception as e:
             return f"Command execution failed: {str(e)}"
 
+    INTERACTIVE_PROMPTS = (
+        re.compile(r"msf\d?\s*(?:exploit\(.+?\)|payload\(.+?\))?\s*>\s*$", re.MULTILINE),
+        re.compile(r"meterpreter\s*>\s*$", re.MULTILINE),
+        re.compile(r"\[sudo\] password for .+:|Password:\s*$", re.IGNORECASE | re.MULTILINE),
+        re.compile(r"\[[yY]/[nN]\]|\(yes/no\)\?\s*$", re.IGNORECASE | re.MULTILINE),
+    )
+
     def _execute_pty(self, cmd: str, timeout: Optional[float] = None) -> str:
-        """Executes interactive command using PTY with Sentinel Delimiter protocol."""
+        """Executes interactive command using PTY with Sentinel Delimiter & Quiescence detection."""
         timeout = timeout or self.command_timeout
         channel = self._get_interactive_channel()
         sentinel = f"__PENAGENT_STATUS_{int(time.time() * 1000)}__"
@@ -151,6 +210,7 @@ class RemoteShell:
         channel.send(wrapped_cmd)
 
         start_time = time.time()
+        last_recv_time = time.time()
         buf = ""
         pattern = re.compile(rf"{sentinel}:(-?\d+):__END__")
 
@@ -158,6 +218,7 @@ class RemoteShell:
             if channel.recv_ready():
                 chunk = channel.recv(8192).decode('utf-8', errors='replace')
                 buf += chunk
+                last_recv_time = time.time()
 
                 match = pattern.search(buf)
                 if match:
@@ -172,9 +233,22 @@ class RemoteShell:
                         clean_output += f"\n[Exit Status: {exit_code}]"
                     return self._truncate_output(clean_output)
 
-            if time.time() - start_time > timeout:
+            now = time.time()
+            # Quiescence detection: output has been idle for >= 0.8s and matches an interactive prompt
+            if buf.strip() and (now - last_recv_time >= 0.8) and (now - start_time >= 1.0):
+                clean_stripped = self.strip_ansi(buf).strip()
+                last_line = clean_stripped.splitlines()[-1] if clean_stripped else ""
+                for prompt_pat in self.INTERACTIVE_PROMPTS:
+                    if prompt_pat.search(last_line):
+                        return self._truncate_output(
+                            f"{clean_stripped}\n[Interactive prompt detected: waiting for input]"
+                        )
+
+            if now - start_time > timeout:
                 channel.send('\x03')  # Send Ctrl+C on timeout
                 time.sleep(0.5)
+                if channel.recv_ready():
+                    buf += channel.recv(8192).decode('utf-8', errors='replace')
                 clean_output = self.strip_ansi(buf).strip()
                 return f"{clean_output}\n[Command timed out after {timeout}s]"
 
