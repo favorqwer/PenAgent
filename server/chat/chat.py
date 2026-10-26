@@ -21,13 +21,21 @@ from utils.log_common import build_logger
 
 logger = build_logger()
 
+# One gateway session and one client per configuration for the whole process.
+#
+# This used to allocate a new ``x-opencode-session`` header and a new OpenAI
+# client on every single call, which the gateway treats as a cold session:
+# ~10s per call instead of ~1s (measured on identical prompts).
+_SESSION_ID = uuid.uuid4()
+_CLIENTS = {}
+
 
 class OpenAIChat(ABC):
     def __init__(self, config):
         self.config = config
         default_headers = {}
         if "opencode" in str(self.config.base_url).lower():
-            default_headers["x-opencode-session"] = str(uuid.uuid4())
+            default_headers["x-opencode-session"] = str(_SESSION_ID)
         self.client = OpenAI(
             api_key=self.config.api_key,
             base_url=self.config.base_url,
@@ -82,6 +90,20 @@ class OllamaChat(ABC):
             return f"**ERROR**: {str(e)}"
 
 
+def _client_for(config):
+    """Reuse one client per (base_url, model) instead of rebuilding it per call."""
+    key = (str(config.base_url), str(config.llm_model), str(config.llm_model_name))
+    client = _CLIENTS.get(key)
+    if client is None:
+        client = OpenAIChat(config=config) if config.llm_model == LLMType.OPENAI else None
+        if client is None and config.llm_model == LLMType.OLLAMA:
+            client = OllamaChat(config=config)
+        if client is None:
+            return None
+        _CLIENTS[key] = client
+    return client
+
+
 def _chat(query: str, kb_name=None, conversation_id=None, kb_query=None, summary=True):
     try:
         if Configs.basic_config.enable_rag and kb_name is not None:
@@ -134,11 +156,11 @@ def _chat(query: str, kb_name=None, conversation_id=None, kb_query=None, summary
         # Add user query to the message history
         history.append({"role": "user", "content": query})
 
-        # Initialize the correct model client
+        # Reuse the client instead of rebuilding it on every call
         if Configs.llm_config.llm_model == LLMType.OPENAI:
-            client = OpenAIChat(config=Configs.llm_config)
+            client = _client_for(Configs.llm_config)
         elif Configs.llm_config.llm_model == LLMType.OLLAMA:
-            client = OllamaChat(config=Configs.llm_config)
+            client = _client_for(Configs.llm_config)
         else:
             return "Unsupported model type"
 
