@@ -96,9 +96,10 @@ Replace `{max_interactions}` with the desired number of interactions. (For compa
 
 ### Layered Agent
 
-An alternative orchestration engine with LLM-written task plans, a ReAct loop per
-task, evidence-based verification, layered budgets, command-level approval and
-checkpointed resume:
+A second orchestration engine built on LangGraph 1.x: LLM-written task plans
+(DAG), a ReAct loop per task, one LLM judge per task, failures handed back to the
+planner verbatim, layered budgets, command-level approval, context budgets,
+per-node token accounting, checkpointed resume and forking.
 
 ```sh
 python cli.py agent -t 100.84.151.2                 # full run
@@ -106,13 +107,36 @@ python cli.py agent -t 100.84.151.2 --dry-run       # no API calls, no SSH
 python cli.py agent -t 100.84.151.2 --hitl          # approve intrusive commands
 python cli.py agent -t 100.84.151.2 --thread-id my-run --resume
 
+# inspect a run, then re-run only its tail
+python cli.py agent --history --thread-id my-run
+python cli.py agent -t 100.84.151.2 --thread-id my-run --from-checkpoint a52277
+
 # switch lab (Kali + target), see agents.md for the IP table
 run_lab1.cmd
 run_lab2.cmd
 ```
 
-See [docs/AGENT.md](docs/AGENT.md) for the architecture, state model,
-verdict rules and extension points. The original `penagent` command and benchmark are unchanged.
+Design notes worth knowing before reading the code:
+
+- **The model judges, code only observes.** Every finished task costs one
+  evaluator call, fed with tool output and commands but never with the
+  assistant's own claims. A scan that completes with a negative result is a valid
+  answer, which no keyword list got right.
+- **Failures are described, not classified.** The replan prompt carries the
+  failed task, its last command, the evaluator's reason and the decisive output;
+  the planner picks the next angle.
+- **Deterministic code is reserved for facts.** Fact extraction, exit codes and
+  the destructive-command kill switch. `compromised` comes only from
+  `uid=0`/flag evidence in the output, so no report can claim root without it.
+- **The loop has brakes.** Unknown tool names are not charged to the budget, and
+  repeated identical observations with no new facts end the task.
+- **Context and cost are bounded** by explicit budgets; every model call is
+  attributed to the node that made it.
+
+See [docs/AGENT.md](docs/AGENT.md) for the architecture, state model, verdict
+rules, configuration reference and extension points. Run the suite with
+`python -m unittest discover -s tests -t .` (96 tests, no API key or SSH needed).
+The original `penagent` command and benchmark are unchanged.
 
 ### Benchmark & Evaluation
 
