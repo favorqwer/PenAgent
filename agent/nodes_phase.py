@@ -77,6 +77,33 @@ def _failure_brief(state: Dict[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _attack_guidance(state: Dict[str, Any], replan: bool) -> str:
+    """Retrieve multi-hop attack chains and preconditions from LightRAG for scanner and exploiter."""
+    phase = state.get("phase", "collector")
+    if phase not in ("scanner", "exploiter"):
+        return ""
+
+    facts_summary = render_facts(state, 2000)
+    if not facts_summary or "None confirmed yet" in facts_summary:
+        return ""
+
+    try:
+        from rag.lightrag_service import PenAgentLightRAG
+        rag_service = PenAgentLightRAG.get_instance()
+        if replan:
+            fail_reason = _failure_brief(state)
+            query_facts = f"Target facts:\n{facts_summary}\n\nLast attempt failed with:\n{fail_reason}\nProvide alternative exploit or bypass paths."
+        else:
+            query_facts = facts_summary
+
+        guidance = rag_service.query_attack_chain(query_facts, mode="hybrid")
+        if guidance and len(guidance.strip()) > 50:
+            return f"\nKNOWLEDGE GRAPH ATTACK CHAIN GUIDANCE (Use these tactical paths to structure your plan):\n{guidance.strip()}\n"
+    except Exception as e:
+        logger.warning(f"LightRAG guidance lookup skipped: {e}")
+    return ""
+
+
 def _plan_prompt(state: Dict[str, Any], replan: bool) -> str:
     conf = get_phase(state.get("phase", "collector"))
     constraints = "; ".join(state.get("constraints") or []) or "stay in scope"
@@ -91,6 +118,7 @@ def _plan_prompt(state: Dict[str, Any], replan: bool) -> str:
         entry=conf.entry,
         exit_success=conf.exit_success,
         facts=render_facts(state, int(cfg("context.max_planner_facts", 12000))),
+        attack_guidance=_attack_guidance(state, replan),
         summary=_previous_summary(state),
         completed=_render_tasks(state.get("plan") or [], ["success"]),
         failed=_render_tasks(state.get("plan") or [], ["failed", "blocked"]),

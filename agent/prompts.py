@@ -22,7 +22,7 @@ Phase exit (success) condition: {exit_success}
 
 KNOWN FACTS
 {facts}
-
+{attack_guidance}
 PREVIOUS PHASE SUMMARY
 {summary}
 
